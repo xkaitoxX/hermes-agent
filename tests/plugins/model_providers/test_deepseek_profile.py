@@ -164,6 +164,54 @@ class TestDeepSeekModelGating:
         assert top_level == {}
 
 
+class TestDeepSeekChatMode:
+    """Fork: ``deepseek-chat`` is a first-class id pinned to non-thinking chat mode.
+
+    The API serves ``deepseek-chat`` with Flash, whose server default is thinking ON, so the
+    profile must *send* ``thinking: disabled`` -- omitting it would turn thinking on.
+    """
+
+    @pytest.mark.parametrize(
+        "reasoning_config",
+        [None, {"enabled": True, "effort": "high"}, {"enabled": False}, {"effort": "max"}],
+    )
+    def test_chat_always_sends_thinking_disabled(self, deepseek_profile, reasoning_config):
+        extra_body, top_level = deepseek_profile.build_api_kwargs_extras(
+            reasoning_config=reasoning_config, model="deepseek-chat"
+        )
+        assert extra_body == {"thinking": {"type": "disabled"}}
+        assert top_level == {}
+
+    def test_chat_is_case_insensitive(self, deepseek_profile):
+        extra_body, _ = deepseek_profile.build_api_kwargs_extras(reasoning_config=None, model="DeepSeek-Chat")
+        assert extra_body == {"thinking": {"type": "disabled"}}
+
+    def test_chat_is_offered_in_the_picker(self, deepseek_profile):
+        from hermes_cli.models_catalog_static import _PROVIDER_MODELS
+        assert "deepseek-chat" in deepseek_profile.fallback_models
+        assert "deepseek-chat" in _PROVIDER_MODELS["deepseek"]
+
+    def test_chat_survives_normalization(self):
+        from hermes_cli.model_normalize import normalize_model_for_provider
+        assert normalize_model_for_provider("deepseek-chat", "deepseek") == "deepseek-chat"
+
+    def test_chat_full_kwargs_wire_shape(self, deepseek_profile):
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        kwargs = ChatCompletionsTransport().build_kwargs(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": "ping"}],
+            tools=None,
+            provider_profile=deepseek_profile,
+            reasoning_config={"enabled": True, "effort": "high"},
+            base_url="https://api.deepseek.com/v1",
+            provider_name="deepseek",
+        )
+        assert kwargs["model"] == "deepseek-chat"
+        assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+        assert "reasoning_effort" not in kwargs
+
+
 class TestDeepSeekFullKwargsIntegration:
     """End-to-end: the transport's full kwargs match DeepSeek's live wire format.
 

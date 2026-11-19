@@ -87,13 +87,13 @@ _CATALOGUE_PREFIX_REPAIR_PROVIDERS: frozenset[str] = frozenset({
 _LOWERCASE_MODEL_PROVIDERS: frozenset[str] = frozenset({
     "xiaomi"})
 
-# DeepSeek retired ``deepseek-chat`` / ``deepseek-reasoner`` on 2026-07-24 (HTTP 400 since); saved
-# configs still carry them, so they fold onto the current Flash id (thinking mode is controlled by
-# extra_body.thinking on the profile). Every other id is the user's call and goes to the wire as typed:
-# a shape-based allow-list swallowed the vendor's own ``deepseek-flash`` the day it shipped (#107206),
-# and any new id without a ``v<N>`` marker would have met the same fate.
-_DEEPSEEK_RETIRED_ALIASES: dict[str, str] = {
-    "deepseek-chat": "deepseek-flash", "deepseek-reasoner": "deepseek-flash"}
+# ``deepseek-reasoner`` is retired and folds onto the current Flash id (thinking mode is controlled by
+# extra_body.thinking on the profile). ``deepseek-chat`` is kept as a first-class id in this fork: the
+# API still accepts it (served by Flash), and the DeepSeek profile pins it to non-thinking chat mode,
+# matching what ``deepseek-chat`` always meant. Every other id is the user's call and goes to the wire
+# as typed: a shape-based allow-list swallowed the vendor's own ``deepseek-flash`` the day it shipped
+# (#107206), and any new id without a ``v<N>`` marker would have met the same fate.
+_DEEPSEEK_RETIRED_ALIASES: dict[str, str] = {"deepseek-reasoner": "deepseek-flash"}
 
 
 def _normalize_for_deepseek(model_name: str) -> str:

@@ -4,8 +4,10 @@ V4 defaults to thinking ON when ``extra_body.thinking`` is unset, and then
 requires ``reasoning_content`` to be echoed back on later turns (HTTP 400 after
 the first tool call otherwise). This profile sets ``thinking`` explicitly and
 maps effort onto DeepSeek's ``reasoning_effort``; V3 models are left untouched.
-Retired ``deepseek-chat``/``deepseek-reasoner`` IDs are remapped in
-``hermes_cli.model_normalize`` before reaching here.
+The retired ``deepseek-reasoner`` ID is remapped in ``hermes_cli.model_normalize``
+before reaching here. ``deepseek-chat`` is kept (fork): the API serves it with
+Flash, and this profile always sends ``thinking: disabled`` for it, so it is the
+fast non-thinking chat mode -- the meaning the id always had.
 """
 
 from typing import Any
@@ -21,6 +23,11 @@ from providers.base import ProviderProfile
 # ``build_api_kwargs_extras`` cannot recognise it.
 _THINKING_CAPABLE_IDS: frozenset[str] = frozenset({"deepseek-flash"})
 
+# Ids that always run with thinking off. ``deepseek-chat`` is served by Flash, whose server
+# default is thinking ON, so ``thinking: disabled`` must be sent explicitly on every request
+# (omitting it would turn thinking on and trip the reasoning_content echo contract).
+_CHAT_MODE_IDS: frozenset[str] = frozenset({"deepseek-chat"})
+
 
 class DeepSeekProfile(ProviderProfile):
     """DeepSeek — extra_body.thinking + top-level reasoning_effort."""
@@ -29,6 +36,8 @@ class DeepSeekProfile(ProviderProfile):
         self, *, reasoning_config: dict | None = None, model: str | None = None, **context
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         m = (model or "").strip().lower()
+        if m in _CHAT_MODE_IDS:
+            return {"thinking": {"type": "disabled"}}, {}
         # v4+ only; v3 excluded. Version-less canonicals (``deepseek-flash``) carry the
         # same thinking-mode contract but no ``v<N>`` prefix, so consult the id set too —
         # missing them makes Hermes omit ``thinking``, so the server defaults to on and
@@ -54,7 +63,7 @@ class DeepSeekProfile(ProviderProfile):
 deepseek = DeepSeekProfile(
     name="deepseek", aliases=("deepseek-chat", "deep-seek"), env_vars=("DEEPSEEK_API_KEY",), display_name="DeepSeek",
     description="DeepSeek — native DeepSeek API", signup_url="https://platform.deepseek.com/",
-    fallback_models=("deepseek-v4-pro", "deepseek-flash"), base_url="https://api.deepseek.com/v1",
+    fallback_models=("deepseek-v4-pro", "deepseek-flash", "deepseek-chat"), base_url="https://api.deepseek.com/v1",
     default_aux_model="deepseek-flash",
     # Native API implements only ``json_object`` (https://api-docs.deepseek.com/guides/json_mode);
     # ``json_schema`` is a guaranteed HTTP 400 "This response_format type is unavailable now".

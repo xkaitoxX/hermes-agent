@@ -271,7 +271,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = _CuratedCatalog({
         "claude-sonnet-4-6", "claude-opus-4-5-20251101", "claude-sonnet-4-5-20250929",
         "claude-opus-4-20250514", "claude-sonnet-4-20250514", "claude-haiku-4-5-20251001",
     ],
-    "deepseek": ["deepseek-flash", "deepseek-v4-pro"],
+    "deepseek": ["deepseek-flash", "deepseek-v4-pro", "deepseek-chat"],
     "xiaomi": [
         "mimo-v2.6-pro", "mimo-v2.6-flash", "mimo-v2.6-pro-ultraspeed",
         "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "mimo-v2-flash",
@@ -672,7 +672,8 @@ _SILENT_DEFAULT_PROVIDERS: frozenset[str] = frozenset({"nous", "openrouter"})
 # Retired model IDs kept for /model auto-detect only — not shown in pickers. DeepSeek cut these
 # off; model_normalize remaps them on the wire.
 _PROVIDER_RETIRED_ALIASES: dict[str, tuple[str, ...]] = {
-    "deepseek": ("deepseek-chat", "deepseek-reasoner"),
+    # Fork: ``deepseek-chat`` is a first-class picker entry (non-thinking chat mode), not retired.
+    "deepseek": ("deepseek-reasoner",),
 }
 
 
