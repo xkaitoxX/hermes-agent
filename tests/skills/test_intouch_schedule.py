@@ -74,6 +74,25 @@ def test_labels_hit_matches_whole_words_only(intouch):
     assert intouch._labels_hit(elems[1:], ["book on"]) is None
 
 
+def test_redact_hides_the_password(intouch):
+    assert intouch._redact("Login failed for hunter2!", "hunter2") == "Login failed for [redacted]!"
+    assert intouch._redact("Login failed", None) == "Login failed"
+
+
+def test_login_refuses_after_a_failed_attempt(intouch, tmp_path, monkeypatch):
+    monkeypatch.setattr(intouch, "LOGIN_BLOCK_FILE", tmp_path / "login_blocked")
+    (tmp_path / "login_blocked").write_text("x")
+    with pytest.raises(intouch.PhoneError, match="paused"):
+        intouch.login(intouch.DEFAULTS, [])
+
+
+def test_login_without_saved_password_asks_user(intouch, tmp_path, monkeypatch):
+    monkeypatch.setattr(intouch, "LOGIN_BLOCK_FILE", tmp_path / "login_blocked")
+    monkeypatch.setattr(intouch, "SECRET_FILE", tmp_path / "password")
+    with pytest.raises(intouch.PhoneError, match="set-password"):
+        intouch.login(intouch.DEFAULTS, [])
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone

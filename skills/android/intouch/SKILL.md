@@ -46,6 +46,15 @@ $IT config check_times '["07:00","13:00","19:00"]'
 - "Is auto book-on running?" -> `status`; offer `start` if stopped.
 - A shift is missing -> `refresh`, then `add-shift` with the times the user gives.
 
+## Login
+
+InTouch logs itself out. The tool logs back in with a password **the user saved themselves**:
+in the Termux app they run `intouch.py set-password` (typed, not echoed, stored chmod 600 in
+`~/.config/intouch/password`). The script types it straight into the password field; it is never
+printed, logged, or passed to a model. **You (the agent) must never ask for, read, print or set
+this password.** After one rejected login, auto-login pauses (InTouch locks accounts after 3
+failures) and the user is notified; once they have fixed it they run `intouch.py reset-login`.
+
 ## Rules
 
 - Never tap LOGOUT, PAYSLIPS or anything outside book-on; never type the user's password,

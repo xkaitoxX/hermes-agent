@@ -48,10 +48,12 @@ HOME = Path.home()
 CONF_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "intouch"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local" / "state")) / "intouch"
 CONFIG_FILE = CONF_DIR / "config.json"
+SECRET_FILE = CONF_DIR / "password"           # written only by `set-password` (user types it)
 SCHEDULE_FILE = STATE_DIR / "schedule.json"
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "intouch.log"
 PID_FILE = STATE_DIR / "daemon.pid"
+LOGIN_BLOCK_FILE = STATE_DIR / "login_blocked"  # present after a failed login: no more tries
 
 DEFAULTS = {
     "package": "com.mitie.InTouch",
@@ -146,22 +148,110 @@ def ensure_awake_unlocked() -> str:
     return "ok"
 
 
+LOGIN_ERROR_WORDS = ("failed", "incorrect", "invalid", "locked", "not match", "wrong", "error",
+                     "not been activated", "try again")
+
+
+def _read_secret() -> str | None:
+    try:
+        secret = SECRET_FILE.read_text().rstrip("\n")
+    except OSError:
+        return None
+    return secret or None
+
+
+def _redact(text: str, secret: str | None) -> str:
+    return text.replace(secret, "[redacted]") if secret else text
+
+
+def login(cfg: dict, elems: list[dict]) -> None:
+    """Fill InTouch's login form with the password the user saved via `set-password`.
+
+    The password goes straight from the private file to the field via adb; it is never printed,
+    logged or shown to a model. After ONE failed login no further attempts are made (InTouch
+    locks the account after 3) until the user runs `reset-login`.
+    """
+    if LOGIN_BLOCK_FILE.exists():
+        raise PhoneError("InTouch login is paused after a failed attempt (to avoid locking the account). "
+                         "Log in by hand, check the saved password, then run: intouch.py reset-login")
+    secret = _read_secret()
+    if not secret:
+        raise PhoneError("InTouch needs a login and no password is saved. Either log in by hand, or "
+                         "save it once in Termux: intouch.py set-password")
+    fields = [e for e in elems if "EditText" in e["cls"]]
+    pwd = next((e for e in fields if e["password"] or "password" in (e["text"] + e["desc"]).lower()), None)
+    user = next((e for e in fields if e is not pwd), None)
+    button = _labels_hit(elems, ["login", "log in", "sign in"])
+    if not pwd or not button:
+        raise PhoneError("InTouch login form not recognised.")
+    if user is not None and not (user["text"] or "").strip():
+        raise PhoneError("InTouch login form has no username filled in -- the user must log in by hand once.")
+    phone.tap_xy(*pwd["center"])
+    time.sleep(0.8)
+    # Clear anything already in the field, then type the secret (adb `input text` escaping).
+    phone.shell("input keyevent KEYCODE_MOVE_END")
+    phone.shell("input keyevent " + " ".join(["KEYCODE_DEL"] * 40))
+    escaped = secret.replace("%", "%%").replace(" ", "%s")
+    phone.shell("input text " + _shell_quote(escaped))
+    time.sleep(0.5)
+    phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
+    time.sleep(0.8)
+    elems = screen()
+    button = _labels_hit(elems, ["login", "log in", "sign in"]) or button
+    phone.tap_xy(*button["center"])
+    log("login submitted")
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        time.sleep(2)
+        elems = screen()
+        texts = " ".join(_texts(elems))
+        low = texts.lower()
+        if any(t.lower() in low for t in TAB_TITLES):
+            log("login ok")
+            return
+        if "internet connection" in low or "no connection" in low or "network" in low:
+            ok = _labels_hit(elems, ["ok", "close", "dismiss"])
+            if ok:
+                phone.tap_xy(*ok["center"])
+            raise PhoneError("InTouch could not reach its server (network); will retry later.")
+        if any(w in low for w in LOGIN_ERROR_WORDS):
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            LOGIN_BLOCK_FILE.write_text(dt.datetime.now().isoformat(timespec="seconds"))
+            msg = _redact(texts, secret)[:200]
+            notify("InTouch login FAILED", "Auto-login stopped to avoid an account lock. Log in by hand, "
+                   "fix the saved password, then run reset-login. App said: " + msg, nid="intouch-login")
+            raise PhoneError("InTouch rejected the login: " + msg)
+        if "fingerprint" in low or "biometric" in low:
+            return  # an enrol/unlock prompt after login; open_intouch dismisses it
+    raise PhoneError("InTouch did not finish logging in within 30s.")
+
+
+def _shell_quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
 def open_intouch(cfg: dict) -> list[dict]:
-    """Bring InTouch to the main tabs. Cancels the fingerprint prompt (the app stays signed in
-    underneath). Raises PhoneError if the app shows its login form."""
+    """Bring InTouch to the main tabs: dismisses the fingerprint prompt and logs in with the saved
+    password when the app has logged itself out."""
     phone.open_app(cfg["package"])
-    deadline = time.time() + 25
+    deadline = time.time() + 60
+    logged_in = False
     while time.time() < deadline:
         time.sleep(1.5)
         elems = screen()
         texts = " ".join(_texts(elems)).lower()
         if "fingerprint" in texts or "biometric" in texts:
-            cancel = _labels_hit(elems, ["cancel", "use password", "not now"])
+            cancel = _labels_hit(elems, ["cancel", "use password", "not now", "no thanks", "skip"])
             if cancel:
                 phone.tap_xy(*cancel["center"])
                 continue
         if any("EditText" in e["cls"] and e["password"] for e in elems) or "forgotten password" in texts:
-            raise PhoneError("InTouch is showing its login screen -- the user must log in once by hand.")
+            if logged_in:
+                raise PhoneError("InTouch returned to its login screen after logging in.")
+            login(cfg, elems)
+            logged_in = True
+            continue
         if any(t.lower() in texts for t in (x.lower() for x in TAB_TITLES)):
             return elems
     raise PhoneError("InTouch did not reach its main screen in time.")
@@ -520,6 +610,9 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("time")
     b = sub.add_parser("book-on")
     b.add_argument("--dry-run", action="store_true")
+    sub.add_parser("set-password", help="save the InTouch password (you type it; not echoed)")
+    sub.add_parser("clear-password")
+    sub.add_parser("reset-login", help="allow auto-login again after a failed attempt")
     lg = sub.add_parser("log")
     lg.add_argument("n", nargs="?", type=int, default=30)
     c = sub.add_parser("config")
@@ -537,7 +630,8 @@ def main(argv: list[str] | None = None) -> int:
             info = {"service": f"running (pid {daemon_pid()})" if daemon_pid() else "stopped",
                     "next_shift": nxt, "window": [w.isoformat(timespec="minutes") for w in window(nxt, cfg)] if nxt else None,
                     "next_shift_state": state["shifts"].get(nxt["start"]) if nxt else None,
-                    "saved_shifts": len(sched), "check_times": cfg["check_times"]}
+                    "saved_shifts": len(sched), "check_times": cfg["check_times"],
+                    "password_saved": SECRET_FILE.exists(), "login_paused_after_failure": LOGIN_BLOCK_FILE.exists()}
             print(json.dumps(info, indent=2))
         elif args.cmd == "shifts":
             texts, _ = read_shift_list(cfg)
@@ -567,6 +661,27 @@ def main(argv: list[str] | None = None) -> int:
             outcome, detail = book_on_once(cfg, dry_run=args.dry_run)
             log(f"manual book-on: {outcome} -- {detail}")
             print(json.dumps({"outcome": outcome, "detail": detail}, indent=2))
+        elif args.cmd == "set-password":
+            import getpass
+            if not sys.stdin.isatty():
+                raise SystemExit("Run this yourself in the Termux app so you can type the password.")
+            first = getpass.getpass("InTouch password (not shown): ")
+            again = getpass.getpass("Again to confirm: ")
+            if not first or first != again:
+                raise SystemExit("Passwords did not match; nothing saved.")
+            CONF_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(CONF_DIR, 0o700)
+            fd = os.open(SECRET_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(first)
+            LOGIN_BLOCK_FILE.unlink(missing_ok=True)
+            print(f"Saved (readable only by Termux): {SECRET_FILE}")
+        elif args.cmd == "clear-password":
+            SECRET_FILE.unlink(missing_ok=True)
+            print("Saved InTouch password deleted.")
+        elif args.cmd == "reset-login":
+            LOGIN_BLOCK_FILE.unlink(missing_ok=True)
+            print("Auto-login allowed again.")
         elif args.cmd == "start":
             start()
         elif args.cmd == "stop":
