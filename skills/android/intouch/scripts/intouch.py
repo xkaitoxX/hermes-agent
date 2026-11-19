@@ -190,7 +190,7 @@ def ensure_awake_unlocked() -> str:
             return "ok"
         except PhoneError as exc:
             log(f"automatic unlock failed: {exc}")
-            if phone.UNLOCK_BLOCK_FILE.exists():
+            if "did not unlock" in str(exc):  # a fresh failure just now -- not the standing pause
                 notify("Automatic unlock stopped", "The saved PIN did not unlock the phone, so automatic "
                        "unlock is paused (to avoid Android's lockout). Unlock by hand, check the PIN, then "
                        "run: phone.py reset-unlock", nid="intouch-unlock-failed")
