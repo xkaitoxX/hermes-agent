@@ -1,0 +1,37 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# hermes-custom: run THIS fork's source on top of the official Hermes Termux runtime.
+#
+# The hermes-agent APT package (canary channel) ships the hard parts for Android: a bionic
+# CPython 3.14, prebuilt native wheels, Node and ffmpeg. Its own launcher runs the source tree
+# in $PREFIX/lib/hermes-agent/app. This launcher is identical except that the source tree is
+# our fork checkout (HERMES_CUSTOM_SRC, default ~/hermes-custom), so our changes apply on the
+# phone without rebuilding the package. Keep the fork on the same release as the runtime
+# (see install-custom.sh) so pure-Python code matches the bundled native wheels.
+set -eu
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+export PREFIX
+root="$PREFIX/lib/hermes-agent"
+PYTHON="$root"/venv/bin/python
+REPO="${HERMES_CUSTOM_SRC:-$HOME/hermes-custom}"
+SITE="$root"/venv/lib/python3.14/site-packages
+[ -x "$PYTHON" ] || { echo 'Hermes runtime missing: pkg install hermes-agent (canary channel)' >&2; exit 2; }
+[ -f "$REPO/hermes_cli/main.py" ] || { echo "Fork source not found in $REPO (run install-custom.sh)" >&2; exit 2; }
+unset PYTHONPATH PYTHONHOME
+export PYTHONPATH="$REPO:$SITE"
+export HERMES_SITE="$SITE"
+export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-${XDG_CACHE_HOME:-$HOME/.cache}/hermes-custom-pycache}"
+export LD_LIBRARY_PATH="$root/tools/python/data/data/com.termux/files/usr/lib:$root/tools/node/data/data/com.termux/files/usr/lib:$root/tools/ffmpeg/data/data/com.termux/files/usr/lib:$root/runtime-libs/lib:$PREFIX/lib"
+export HERMES_PYTHON_SRC_ROOT="$REPO"
+export HERMES_PYTHON="$PYTHON"
+export HERMES_NODE="$root/tools/node/data/data/com.termux/files/usr/bin/node"
+export HERMES_RUNTIME_DIR="$root/tools"
+export PATH="$root/tools/npm/bin:$root/tools/node/data/data/com.termux/files/usr/bin:$root/tools/ffmpeg/data/data/com.termux/files/usr/bin:$root/tools/ripgrep:$PATH"
+if [ "${1-}" = --run-module ]; then
+    case "${2-}" in
+        ""|[!A-Za-z_]*|*[!A-Za-z0-9_.]*) echo 'hermes-custom: --run-module needs a module' >&2; exit 2 ;;
+    esac
+    module=$2
+    shift 2
+    exec "$PYTHON" -P -c "import os, sys, runpy; import site; site.addsitedir(os.environ['HERMES_SITE']); runpy.run_module('$module', run_name='__main__', alter_sys=True)" "$@"
+fi
+exec "$PYTHON" -P -c 'import os, site, sys; sys.argv[0]='"'"'hermes'"'"'; site.addsitedir(os.environ['"'"'HERMES_SITE'"'"']); from hermes_cli.main import main; sys.exit(main())' "$@"
