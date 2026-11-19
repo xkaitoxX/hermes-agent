@@ -438,6 +438,16 @@ def merge_schedule(found: list[dict], replace_source: bool) -> list[dict]:
     return merged
 
 
+_PLAIN_CAL_RE = re.compile(
+    r"^((mon|tue|wed|thu|fri|sat|sun)[a-z]*( \d{1,2} [a-z]+ \d{4})?|[a-z]+ \d{4}|today|refresh|"
+    r"go (back|forward) to the (previous|next) month|\d{1,2})$", re.IGNORECASE)
+
+
+def has_shift_content(texts: list[str]) -> bool:
+    """True when the screens show more than InTouch's empty-state text and plain calendar labels."""
+    return any(not _PLAIN_CAL_RE.match(t.strip()) and NO_SHIFTS_TEXT not in t.lower() for t in texts)
+
+
 def refresh_schedule(cfg: dict) -> list[dict]:
     shift_texts, _ = read_shift_list(cfg)
     texts = list(shift_texts)
@@ -445,8 +455,8 @@ def refresh_schedule(cfg: dict) -> list[dict]:
         texts += read_calendar(cfg)
     except PhoneError as exc:
         log(f"calendar read failed: {exc}")
-    found = [] if any(NO_SHIFTS_TEXT in t.lower() for t in shift_texts) and len(shift_texts) < 4 else parse_shifts(texts)
-    if not found and cfg["use_ai_for_schedule"] and not any(NO_SHIFTS_TEXT in t.lower() for t in shift_texts):
+    found = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
+    if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts):
         found = ai_extract(texts, cfg)
     sched = merge_schedule(found, replace_source=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)

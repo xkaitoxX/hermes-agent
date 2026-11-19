@@ -93,6 +93,17 @@ def test_login_without_saved_password_asks_user(intouch, tmp_path, monkeypatch):
         intouch.login(intouch.DEFAULTS, [])
 
 
+def test_empty_app_has_no_shift_content(intouch):
+    real_empty_read = ["You don't have any shifts right now.", "REFRESH", "Go back to the previous month",
+                       "Go forward to the next month", "November 2026", "Today", "Monday 26 October 2026",
+                       "Thursday 19 November 2026", "Monday", "Tuesday", "19"]
+    assert intouch.has_shift_content(real_empty_read) is False
+
+
+def test_calendar_with_a_shift_marker_has_content(intouch):
+    assert intouch.has_shift_content(["November 2026", "Friday 20 November 2026", "Day shift - Site A"]) is True
+
+
 def test_type_command_types_each_character_exactly(intouch):
     cmd = intouch._type_command("a b%s'!")
     assert cmd == ("input text a; input keyevent 62; input text b; input text %; input text s; "
