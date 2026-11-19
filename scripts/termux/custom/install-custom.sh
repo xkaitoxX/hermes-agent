@@ -38,10 +38,11 @@ echo "== Installing launcher"
 install -m 0755 "$SRC/scripts/termux/custom/hermes-custom" "$PREFIX/bin/hermes-custom"
 
 # A gateway left running from before the update keeps executing the old code in memory;
-# stop it so the next turn starts one from the updated checkout.
-if pgrep -f "hermes_cli.main .*gateway run" >/dev/null 2>&1; then
-  echo "== Restarting the gateway onto the updated code"
-  hermes-custom gateway stop >/dev/null 2>&1 || pkill -f "hermes_cli.main .*gateway run" || true
+# always stop it (a no-op when none runs) so the next turn starts one from the updated checkout.
+echo "== Restarting the gateway onto the updated code"
+hermes-custom gateway stop >/dev/null 2>&1 || true
+if ps -eo args 2>/dev/null | grep -q "[h]ermes_cli.main .*gateway run"; then
+  pkill -f "hermes_cli.main .*gateway run" 2>/dev/null || true
 fi
 
 echo "== Versions"
