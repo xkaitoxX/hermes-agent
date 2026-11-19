@@ -165,6 +165,16 @@ const sidebars: SidebarsConfig = {
               items: [
                 {
                   type: 'category',
+                  label: 'android',
+                  key: 'skills-bundled-android',
+                  collapsed: true,
+                  items: [
+                    'user-guide/skills/bundled/android/android-intouch',
+                    'user-guide/skills/bundled/android/android-phone-control',
+                  ],
+                },
+                {
+                  type: 'category',
                   label: 'apple',
                   key: 'skills-bundled-apple',
                   collapsed: true,
