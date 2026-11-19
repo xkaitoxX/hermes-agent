@@ -49,6 +49,9 @@ install -m 0755 "$SRC/scripts/termux/custom/hermes-custom" "$PREFIX/bin/hermes-c
 
 # A gateway left running from before the update keeps executing the old code in memory;
 # always stop it (a no-op when none runs) so the next turn starts one from the updated checkout.
+echo "== Syncing bundled skills (adds new ones such as skills/android/*)"
+hermes-custom --run-module tools.skills_sync 2>&1 | tail -1 || true
+
 echo "== Restarting the gateway onto the updated code"
 hermes-custom gateway stop >/dev/null 2>&1 || true
 if ps -eo args 2>/dev/null | grep -q "[h]ermes_cli.main .*gateway run"; then
