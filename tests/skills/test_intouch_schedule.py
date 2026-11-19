@@ -96,7 +96,7 @@ def test_login_without_saved_password_asks_user(intouch, tmp_path, monkeypatch):
 def test_empty_app_has_no_shift_content(intouch):
     real_empty_read = ["You don't have any shifts right now.", "REFRESH", "Go back to the previous month",
                        "Go forward to the next month", "November 2026", "Today", "Monday 26 October 2026",
-                       "Thursday 19 November 2026", "Monday", "Tuesday", "19"]
+                       "Thursday 19 November 2026", "Monday", "Tuesday", "19", "REQUEST HOLIDAY"]
     assert intouch.has_shift_content(real_empty_read) is False
 
 

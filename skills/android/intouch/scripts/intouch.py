@@ -443,9 +443,13 @@ _PLAIN_CAL_RE = re.compile(
     r"go (back|forward) to the (previous|next) month|\d{1,2})$", re.IGNORECASE)
 
 
+_BUTTON_RE = re.compile(r"^[A-Z][A-Z ]{2,30}$")  # all-caps button labels: REFRESH, REQUEST HOLIDAY
+
+
 def has_shift_content(texts: list[str]) -> bool:
-    """True when the screens show more than InTouch's empty-state text and plain calendar labels."""
-    return any(not _PLAIN_CAL_RE.match(t.strip()) and NO_SHIFTS_TEXT not in t.lower() for t in texts)
+    """True when the screens show more than InTouch's empty-state text, buttons and plain calendar labels."""
+    return any(not _PLAIN_CAL_RE.match(t.strip()) and not _BUTTON_RE.match(t.strip())
+               and NO_SHIFTS_TEXT not in t.lower() for t in texts)
 
 
 def refresh_schedule(cfg: dict) -> list[dict]:
