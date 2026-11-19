@@ -66,10 +66,12 @@ One-time: install tools in Termux: `pkg install android-tools python termux-api`
 After each reboot, re-enable adb on localhost, either way:
 
 - **With a PC:** plug in with USB debugging on and run `adb tcpip 5555` on the PC.
-- **Without a PC (Wi-Fi needed once):** Developer options -> Wireless debugging -> on ->
-  "Pair device with pairing code". In Termux (split screen):
-  `adb pair 127.0.0.1:<pair-port> <code>`, then `adb connect 127.0.0.1:<port>` (the port
-  shown on the Wireless debugging screen), then `adb -s 127.0.0.1:<port> tcpip 5555`.
+- **Without a PC (Wi-Fi needed):** pair once: Developer options -> Wireless debugging -> on
+  (choose "Always allow on this network") -> "Pair device with pairing code"; keep that screen
+  open and in Termux (split screen) run `adb pair 127.0.0.1:<pair-port> <code>`.
+  After that, `intouch.py reconnect` (and the intouch service, automatically) finds the
+  Wireless-debugging port by itself and re-opens port 5555 -- as long as Wireless debugging
+  is on and the phone is on Wi-Fi.
 
 Then in Termux: `python ~/.hermes/skills/android/phone-control/scripts/phone.py connect`
 and tap **Always allow** on the "Allow USB debugging?" prompt the first time.

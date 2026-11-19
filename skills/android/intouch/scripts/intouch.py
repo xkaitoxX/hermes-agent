@@ -752,23 +752,46 @@ def reconnect_adb() -> bool:
         return True
     except PhoneError:
         pass
-    try:
-        out = phone.adb("mdns", "services", serial=False, check=False, timeout=15)
-    except PhoneError:
-        return False
-    for host_port in re.findall(r"_adb-tls-connect\._tcp\.?\s+([\d.]+:\d+)", out):
-        phone.adb("connect", host_port, serial=False, check=False, timeout=15)
+    # Termux's adb has no mDNS, so find the Wireless-debugging port by probing this phone's own
+    # listening TCP ports on localhost (refused ports answer instantly; takes a few seconds).
+    for port in _open_local_ports(30000, 65535, skip={5555}):
+        host_port = f"127.0.0.1:{port}"
+        out = phone.adb("connect", host_port, serial=False, check=False, timeout=8)
+        if "connected" not in out or "cannot" in out or "failed" in out:
+            continue
         devices = phone.adb("devices", serial=False, check=False)
-        if any(l.startswith(host_port) and l.endswith("device") for l in devices.splitlines()):
-            phone.adb("-s", host_port, "tcpip", "5555", serial=False, check=False, timeout=20)
-            time.sleep(4)
-            try:
-                phone.connect()
-                log(f"phone-control link restored via wireless debugging ({host_port})")
-                return True
-            except PhoneError:
-                continue
+        if not any(l.startswith(host_port) and l.endswith("device") for l in devices.splitlines()):
+            phone.adb("disconnect", host_port, serial=False, check=False)
+            continue
+        phone.adb("-s", host_port, "tcpip", "5555", serial=False, check=False, timeout=20)
+        time.sleep(4)
+        phone.adb("disconnect", host_port, serial=False, check=False)
+        try:
+            phone.connect()
+            log(f"phone-control link restored via wireless debugging (port {port})")
+            return True
+        except PhoneError:
+            continue
     return False
+
+
+def _open_local_ports(lo: int, hi: int, skip: set[int] = frozenset()) -> list[int]:
+    import socket
+
+    found = []
+    for port in range(lo, hi + 1):
+        if port in skip:
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.05)
+        try:
+            if s.connect_ex(("127.0.0.1", port)) == 0:
+                found.append(port)
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return found
 
 
 # ---------------------------------------------------------------- service loop
