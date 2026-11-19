@@ -110,6 +110,103 @@ def test_type_command_types_each_character_exactly(intouch):
                    "input text ''\"'\"''; input text '!'")
 
 
+def _el(text, y, clickable=False):
+    return {"text": text, "desc": "", "clickable": clickable, "center": [600, y], "cls": "TextView", "pkg": ""}
+
+
+def test_two_shifts_same_day_each_gets_its_own_button(intouch):
+    elems = [_el("08:00 - 12:00", 600), _el("BOOK ON", 800, True),
+             _el("16:00 - 20:00", 1300), _el("BOOK ON", 1500, True)]
+    first = intouch._shift_anchor(elems, dt.datetime(2026, 11, 20, 8, 0))
+    second = intouch._shift_anchor(elems, dt.datetime(2026, 11, 20, 16, 0))
+    buttons = intouch._all_hits(elems, intouch.DEFAULTS["book_on_labels"])
+    assert intouch._nearest(buttons, first)["center"][1] == 800
+    assert intouch._nearest(buttons, second)["center"][1] == 1500
+
+
+def test_time_anchor_does_not_match_inside_other_times(intouch):
+    elems = [_el("18:00 - 22:00", 600)]
+    assert intouch._shift_anchor(elems, dt.datetime(2026, 11, 20, 8, 0)) is None  # 8:00 inside 18:00
+
+
+def test_twelve_hour_times_are_recognised(intouch):
+    elems = [_el("Shift 4:30 pm", 600)]
+    assert intouch._shift_anchor(elems, dt.datetime(2026, 11, 20, 16, 30)) is not None
+
+
+class _Clock:
+    def __init__(self, start):
+        self.now = start
+
+
+@pytest.fixture
+def service(intouch, tmp_path, monkeypatch):
+    monkeypatch.setattr(intouch, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(intouch, "STATE_FILE", tmp_path / "state.json")
+    monkeypatch.setattr(intouch, "SCHEDULE_FILE", tmp_path / "schedule.json")
+    monkeypatch.setattr(intouch, "LOG_FILE", tmp_path / "log")
+    monkeypatch.setenv("INTOUCH_VERBOSE", "0")
+    sent = []
+    monkeypatch.setattr(intouch, "notify", lambda title, text, nid="": sent.append(title))
+    svc = intouch._Service()
+    monkeypatch.setattr(svc, "link", lambda cfg, force=False: True)
+    return svc, sent
+
+
+def test_retries_every_two_minutes_until_booked(intouch, service, monkeypatch):
+    svc, sent = service
+    shift = {"start": "2026-11-20T08:00", "end": "2026-11-20T12:00"}
+    results = iter([("not_available", "not on site"), ("not_available", "not on site"), ("booked", "ok")])
+    calls = []
+    monkeypatch.setattr(intouch, "book_on_once", lambda cfg, shift=None: (calls.append(shift["start"]), next(results))[1])
+    t = dt.datetime(2026, 11, 20, 7, 44)
+    for _ in range(20):  # 07:44 .. 07:53:30 in 30 s ticks
+        svc.handle_shift(shift, intouch.DEFAULTS, t)
+        t += dt.timedelta(seconds=30)
+    assert len(calls) == 3                       # 07:45, 07:47, 07:49 -- then booked, stops
+    assert svc.state["shifts"][shift["start"]]["status"] == "booked"
+    assert sent == ["InTouch book-on window open", "Booked on ✔"]
+
+
+def test_window_closing_without_book_on_notifies(intouch, service, monkeypatch):
+    svc, sent = service
+    shift = {"start": "2026-11-20T08:00", "end": None}
+    monkeypatch.setattr(intouch, "book_on_once", lambda cfg, shift=None: ("not_available", "not on site"))
+    t = dt.datetime(2026, 11, 20, 7, 45)
+    while t <= dt.datetime(2026, 11, 20, 8, 16):
+        svc.handle_shift(shift, intouch.DEFAULTS, t)
+        t += dt.timedelta(seconds=30)
+    st = svc.state["shifts"][shift["start"]]
+    assert st["status"] == "missed" and st["attempts"] == 16   # every 2 min across the 30-min window
+    assert sent[-1] == "NOT booked on ✖"
+
+
+def test_two_shifts_in_one_day_are_booked_independently(intouch, service, monkeypatch):
+    svc, sent = service
+    a = {"start": "2026-11-20T08:00", "end": "2026-11-20T12:00"}
+    b = {"start": "2026-11-20T16:00", "end": "2026-11-20T20:00"}
+    booked_for = []
+    monkeypatch.setattr(intouch, "book_on_once",
+                        lambda cfg, shift=None: (booked_for.append(shift["start"]), ("booked", "ok"))[1])
+    for t in (dt.datetime(2026, 11, 20, 7, 50), dt.datetime(2026, 11, 20, 15, 50)):
+        for s in (a, b):
+            svc.handle_shift(s, intouch.DEFAULTS, t)
+    assert booked_for == [a["start"], b["start"]]
+    assert all(svc.state["shifts"][s["start"]]["status"] == "booked" for s in (a, b))
+
+
+def test_a_crashing_tick_does_not_stop_the_service(intouch, service, monkeypatch):
+    svc, _ = service
+    monkeypatch.setattr(svc, "tick", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+    ticks = []
+    monkeypatch.setattr(intouch.time, "sleep", lambda s: (ticks.append(s), len(ticks) > 2 and (_ for _ in ()).throw(SystemExit))[1])
+    monkeypatch.setattr(intouch, "_Service", lambda: svc)
+    monkeypatch.setattr(intouch, "PID_FILE", intouch.STATE_DIR / "pid")
+    with pytest.raises(SystemExit):
+        intouch.daemon(intouch.DEFAULTS)
+    assert len(ticks) == 3  # kept looping after each error
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone

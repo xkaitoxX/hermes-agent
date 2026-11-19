@@ -24,6 +24,14 @@ their line manager (WorkPlace+); InTouch has no shift booking. Attendance is a *
 book on every 2 minutes until InTouch accepts (i.e. once the user has arrived), then notifies
 the user. If the window closes without a book-on it notifies them to do it by hand.
 
+- Several shifts a day are handled independently: each attempt anchors on that shift's start
+  time on screen and taps the book-on control of that card only.
+- Shifts are re-read at the check times and ~1 hour before every window.
+- The service never stops on an error, restarts itself when its code is updated, and the
+  watchdog job restarts it if Android kills it or the phone reboots.
+- InTouch is erratic (fingerprint prompts before and/or after the password, random dialogs);
+  the opener handles them in any order and relaunches the app when stuck.
+
 ```bash
 IT="python ~/.hermes/skills/android/intouch/scripts/intouch.py"
 $IT status          # service running?, next shift, its window, attempts so far
@@ -34,6 +42,8 @@ $IT schedule        # saved upcoming shifts
 $IT add-shift 2026-11-21 08:00 --end 16:00   # if a shift was not picked up
 $IT book-on --dry-run   # show what it would tap (safe)
 $IT start | stop    # background service (reads 3x/day, books on in windows)
+$IT install-watchdog   # Android job: every 15 min + after reboot, restart the service if needed
+$IT reconnect       # try to restore the phone-control link (after a reboot)
 $IT log 40
 $IT config check_times '["07:00","13:00","19:00"]'
 ```

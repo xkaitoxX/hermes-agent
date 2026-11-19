@@ -269,31 +269,64 @@ def _clear_field(field: dict | None = None) -> None:
     phone.shell("input keyevent " + " ".join(["KEYCODE_DEL"] * 60))
 
 
+def _on_main_tabs(elems: list[dict]) -> bool:
+    return any(e["desc"].strip().lower() == "selected" for e in elems) and \
+        any(e["text"] in TAB_TITLES for e in elems)
+
+
 def open_intouch(cfg: dict) -> list[dict]:
-    """Bring InTouch to the main tabs: dismisses the fingerprint prompt and logs in with the saved
-    password when the app has logged itself out."""
+    """Bring InTouch to its main tabs, whatever state the (erratic) app is in.
+
+    Handles, as often as they appear and in any order: the fingerprint prompt (before or after
+    the password), the login form (saved password, at most twice per open and never after a
+    rejection), "Something's wrong"-style OK dialogs, and unknown screens (back, then relaunch).
+    Reuses the app if it is already showing its tabs.
+    """
+    elems = screen()
+    if elems and elems[0]["pkg"] == cfg["package"] and _on_main_tabs(elems):
+        return elems
     phone.open_app(cfg["package"])
-    deadline = time.time() + 60
-    logged_in = False
+    deadline = time.time() + 75
+    logins = 0
+    unknown_since = None
+    relaunched = False
     while time.time() < deadline:
         time.sleep(1.5)
         elems = screen()
         texts = " ".join(_texts(elems)).lower()
-        if "fingerprint" in texts or "biometric" in texts:
-            cancel = _labels_hit(elems, ["cancel", "use password", "not now", "no thanks", "skip"])
+        if _on_main_tabs(elems):
+            return elems
+        if "fingerprint" in texts or "biometric" in texts or "touch the sensor" in texts:
+            cancel = _labels_hit(elems, ["cancel", "use password", "not now", "no thanks", "skip", "later"])
             if cancel:
                 phone.tap_xy(*cancel["center"])
+                unknown_since = None
                 continue
         if any("EditText" in e["cls"] and e["password"] for e in elems) or "forgotten password" in texts:
-            if logged_in:
-                raise PhoneError("InTouch returned to its login screen after logging in.")
+            if logins >= 2:
+                raise PhoneError("InTouch keeps returning to its login screen after logging in.")
             login(cfg, elems)
-            logged_in = True
-            deadline = time.time() + 45  # login took a while; give the post-login prompts time
+            logins += 1
+            deadline = max(deadline, time.time() + 45)  # give post-login prompts time
+            unknown_since = None
             continue
-        if any(t.lower() in texts for t in (x.lower() for x in TAB_TITLES)):
-            return elems
-    raise PhoneError("InTouch did not reach its main screen in time.")
+        ok = _labels_hit(elems, ["ok", "close", "dismiss", "got it"])
+        if ok and len(elems) < 12:  # a small dialog, not a full screen with an OK somewhere
+            log("dismissed dialog: " + " | ".join(_texts(elems))[:150])
+            phone.tap_xy(*ok["center"])
+            continue
+        # Loading spinners, splash screens, other apps: wait a little, then back / relaunch.
+        unknown_since = unknown_since or time.time()
+        if time.time() - unknown_since > 12:
+            if not relaunched:
+                phone.shell("input keyevent 4")
+                time.sleep(1.5)
+                phone.open_app(cfg["package"])
+                relaunched = True
+                unknown_since = None
+            else:
+                break
+    raise PhoneError("InTouch did not reach its main screen in time. Screen: " + " | ".join(_texts(elems))[:200])
 
 
 def goto_tab(index: int) -> list[dict]:
@@ -312,6 +345,9 @@ def goto_tab(index: int) -> list[dict]:
 def read_shift_list(cfg: dict) -> tuple[list[str], list[dict]]:
     open_intouch(cfg)
     elems = goto_tab(0)
+    if not _on_main_tabs(elems):  # the app threw something up while switching tabs
+        open_intouch(cfg)
+        elems = goto_tab(0)
     refresh = _labels_hit(elems, ["refresh"])
     if refresh:
         phone.tap_xy(*refresh["center"])
@@ -324,6 +360,9 @@ def read_shift_list(cfg: dict) -> tuple[list[str], list[dict]]:
 def read_calendar(cfg: dict, months: int = 2) -> list[str]:
     open_intouch(cfg)
     elems = goto_tab(1)
+    if not _on_main_tabs(elems):
+        open_intouch(cfg)
+        elems = goto_tab(1)
     out: list[str] = []
     for m in range(months):
         out += [t for t in _texts(elems) if t not in TAB_TITLES and t not in out]
@@ -484,15 +523,72 @@ def window(shift: dict, cfg: dict) -> tuple[dt.datetime, dt.datetime]:
 
 
 # ---------------------------------------------------------------- book on
-def book_on_once(cfg: dict, dry_run: bool = False) -> tuple[str, str]:
-    """One attempt. Returns (outcome, detail): booked | already | not_available | failed | locked | error."""
+def _time_strings(start: dt.datetime) -> list[str]:
+    """How a shift start may be written on screen: 08:00, 8:00, 8:00 AM, 8:00am."""
+    h12 = start.hour % 12 or 12
+    ap = "am" if start.hour < 12 else "pm"
+    return [f"{start:%H:%M}", f"{start.hour}:{start:%M}", f"{h12}:{start:%M} {ap}", f"{h12}:{start:%M}{ap}"]
+
+
+def _shift_anchor(elems: list[dict], start: dt.datetime) -> dict | None:
+    """The on-screen element showing this shift's start time (the card it belongs to)."""
+    wanted = _time_strings(start)
+    for e in elems:
+        label = (e["text"] or e["desc"] or "").lower()
+        if any(re.search(r"(?<![\d:])" + re.escape(w.lower()) + r"(?![\d])", label) for w in wanted):
+            return e
+    return None
+
+
+def _nearest(elems: list[dict], anchor: dict | None) -> dict | None:
+    """Element closest to the anchor, preferring ones at or below it (same card); first if no anchor."""
+    if not elems:
+        return None
+    if anchor is None:
+        return elems[0]
+    ay = anchor["center"][1]
+    return min(elems, key=lambda e: (e["center"][1] < ay - 40, abs(e["center"][1] - ay)))
+
+
+def _all_hits(elems: list[dict], labels: list[str], clickable_only: bool = True) -> list[dict]:
+    out = []
+    for e in elems:
+        if clickable_only and not e["clickable"]:
+            continue
+        if _labels_hit([e], labels, clickable_only=clickable_only):
+            out.append(e)
+    return out
+
+
+def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) -> tuple[str, str]:
+    """One attempt for ``shift`` (or the only/first shift shown). Returns (outcome, detail):
+    booked | already | not_available | failed | locked | error | dry_run."""
     try:
         if ensure_awake_unlocked() == "locked":
             return "locked", "phone is locked"
         texts, elems = read_shift_list(cfg)
-        if _labels_hit(elems, cfg["booked_labels"], clickable_only=False):
-            return "already", "already booked on (book-off control is showing)"
-        button = _labels_hit(elems, cfg["book_on_labels"])
+        # Opportunistically add shifts shown now that the schedule does not know yet.
+        new = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
+        if new:
+            merge_schedule(new, replace_source=False)
+        start = dt.datetime.fromisoformat(shift["start"]) if shift else None
+        anchor = _shift_anchor(elems, start) if start else None
+        on_buttons = _all_hits(elems, cfg["book_on_labels"])
+        booked_marks = _all_hits(elems, cfg["booked_labels"], clickable_only=False)
+        if anchor is not None:
+            # Only controls belonging to this shift's card count (within ~half a screen below it).
+            near = lambda e: -40 <= e["center"][1] - anchor["center"][1] <= 900  # noqa: E731
+            mine_on = [e for e in on_buttons if near(e)]
+            mine_booked = [e for e in booked_marks if near(e)]
+            if mine_booked and not mine_on:
+                return "already", f"this shift ({start:%H:%M}) already shows as booked on"
+            button = _nearest(mine_on, anchor)
+        else:
+            if booked_marks and not on_buttons:
+                return "already", "already booked on (book-off control is showing)"
+            if len(on_buttons) > 1:
+                log(f"{len(on_buttons)} book-on buttons and the shift time is not shown; using the first")
+            button = on_buttons[0] if on_buttons else None
         if not button:
             return "not_available", "no book-on button yet: " + " | ".join(texts)[:300]
         label = button["text"] or button["desc"]
@@ -510,7 +606,18 @@ def book_on_once(cfg: dict, dry_run: bool = False) -> tuple[str, str]:
             time.sleep(4)
             elems = screen()
         after = _texts(elems)
-        if _labels_hit(elems, cfg["booked_labels"], clickable_only=False):
+        if not _on_main_tabs(elems):  # a result page or dialog; read the list again to verify
+            ok = _labels_hit(elems, ["ok", "close", "done", "dismiss"])
+            if ok:
+                phone.tap_xy(*ok["center"])
+                time.sleep(2)
+            texts2, elems = read_shift_list(cfg)
+            after += texts2
+        anchor2 = _shift_anchor(elems, start) if start else None
+        booked_now = _all_hits(elems, cfg["booked_labels"], clickable_only=False)
+        if anchor2 is not None:
+            booked_now = [e for e in booked_now if -40 <= e["center"][1] - anchor2["center"][1] <= 900]
+        if booked_now or any(w in " ".join(after).lower() for w in ("booked on successfully", "successfully booked")):
             return "booked", " | ".join(after)[:300]
         # A message dialog (e.g. "you are not at the site") -- record it and dismiss.
         ok = _labels_hit(elems, ["ok", "close", "dismiss"])
@@ -526,81 +633,193 @@ def book_on_once(cfg: dict, dry_run: bool = False) -> tuple[str, str]:
             pass
 
 
+# ---------------------------------------------------------------- phone-control link
+def reconnect_adb() -> bool:
+    """Bring back adb-over-localhost after a reboot without a PC, when possible.
+
+    Works when Wireless debugging is on and this Termux was paired once (``adb pair``): the
+    phone's wireless-debugging endpoint is found over mDNS, then ``tcpip 5555`` re-opens the
+    localhost port that survives Wi-Fi changes until the next reboot.
+    """
+    try:
+        phone.connect()
+        return True
+    except PhoneError:
+        pass
+    try:
+        out = phone.adb("mdns", "services", serial=False, check=False, timeout=15)
+    except PhoneError:
+        return False
+    for host_port in re.findall(r"_adb-tls-connect\._tcp\.?\s+([\d.]+:\d+)", out):
+        phone.adb("connect", host_port, serial=False, check=False, timeout=15)
+        devices = phone.adb("devices", serial=False, check=False)
+        if any(l.startswith(host_port) and l.endswith("device") for l in devices.splitlines()):
+            phone.adb("-s", host_port, "tcpip", "5555", serial=False, check=False, timeout=20)
+            time.sleep(4)
+            try:
+                phone.connect()
+                log(f"phone-control link restored via wireless debugging ({host_port})")
+                return True
+            except PhoneError:
+                continue
+    return False
+
+
 # ---------------------------------------------------------------- service loop
+class _Service:
+    """The background service. Every tick is wrapped so no error can stop it."""
+
+    def __init__(self) -> None:
+        self.state = load_json(STATE_FILE, {})
+        self.state.setdefault("checks", {})
+        self.state.setdefault("shifts", {})
+        self.startup_pending = True
+        self.last_read_try = 0.0
+        self.link_ok = True
+        self.last_link_check = 0.0
+        self.link_alerted_at = 0.0
+
+    def save(self) -> None:
+        save_json(STATE_FILE, self.state)
+
+    def link(self, cfg: dict, force: bool = False) -> bool:
+        if not force and time.time() - self.last_link_check < 300 and self.link_ok:
+            return True
+        self.last_link_check = time.time()
+        try:
+            phone.ensure_connected()
+            ok = True
+        except PhoneError:
+            ok = reconnect_adb()
+        if not ok:
+            nxt = next_shift(load_json(SCHEDULE_FILE, []), cfg)
+            when = f" before your {nxt['start'][5:].replace('T', ' ')} shift" if nxt else ""
+            if time.time() - self.link_alerted_at > 4 * 3600:
+                notify("Auto book-on can't control the phone",
+                       f"Phone restarted? Re-enable it{when}: run `adb tcpip 5555` from the PC "
+                       "(or Wireless debugging -- see the phone-control skill).", nid="intouch-link")
+                self.link_alerted_at = time.time()
+            if self.link_ok:
+                log("phone-control link is down")
+        elif not self.link_ok:
+            log("phone-control link is back")
+        self.link_ok = ok
+        return ok
+
+    def read_schedule(self, cfg: dict, now: dt.datetime, why: str) -> bool:
+        self.last_read_try = time.time()
+        if not self.link(cfg, force=True):
+            return False
+        try:
+            if ensure_awake_unlocked() == "locked":
+                log(f"schedule read ({why}) postponed: phone locked")
+                return False
+            refresh_schedule(cfg)
+            return True
+        except PhoneError as exc:
+            log(f"schedule read ({why}) failed: {exc}")
+            return False
+
+    def tick(self) -> None:
+        cfg = config()
+        now = dt.datetime.now()
+        sched = load_json(SCHEDULE_FILE, [])
+        self.link(cfg)
+        # 1. Schedule reads: at start-up and each check time (overdue slots collapse into one
+        #    read), plus a fresh read ~1 hour before every book-on window. Never during a window;
+        #    failed reads retry after 10 minutes.
+        due = [f"{now:%Y-%m-%d} {h}" for h in cfg["check_times"]
+               if now.strftime("%H:%M") >= h and not self.state["checks"].get(f"{now:%Y-%m-%d} {h}")]
+        pre = [s for s in sched if s["start"] not in self.state.get("pre_read", [])
+               and dt.timedelta(minutes=20) <= window(s, cfg)[0] - now <= dt.timedelta(minutes=75)]
+        if (self.startup_pending or due or pre) and time.time() - self.last_read_try >= 600 \
+                and not _in_any_window(cfg, now):
+            why = "start-up" if self.startup_pending else ("pre-window" if pre and not due else "daily")
+            if self.read_schedule(cfg, now, why):
+                self.startup_pending = False
+                for key in due:
+                    self.state["checks"][key] = now.isoformat(timespec="minutes")
+                self.state["pre_read"] = (self.state.get("pre_read", []) + [s["start"] for s in pre])[-50:]
+                week_ago = f"{now - dt.timedelta(days=7):%Y-%m-%d}"
+                self.state["checks"] = {k: v for k, v in self.state["checks"].items() if k[:10] >= week_ago}
+                self.save()
+                sched = load_json(SCHEDULE_FILE, [])
+        # 2. Book-on windows -- every shift on its own, so two shifts in a day are both handled.
+        for shift in sched:
+            self.handle_shift(shift, cfg, now)
+        cutoff = (now - dt.timedelta(days=3)).isoformat(timespec="minutes")
+        self.state["shifts"] = {k: v for k, v in self.state["shifts"].items() if k >= cutoff}
+        self.save()
+
+    def handle_shift(self, shift: dict, cfg: dict, now: dt.datetime) -> None:
+        opens, closes = window(shift, cfg)
+        st = self.state["shifts"].setdefault(shift["start"], {"status": "pending", "attempts": 0})
+        label = shift["start"][11:16]
+        day = "" if shift["start"][:10] == f"{now:%Y-%m-%d}" else f" on {shift['start'][:10]}"
+        if st["status"] != "pending":
+            return
+        if now > closes:
+            st["status"] = "missed"
+            notify("NOT booked on ✖",
+                   f"The book-on window for your {label} shift{day} closed without a book-on. Book on by hand "
+                   f"or tell your manager. Last result: {st.get('last_outcome', 'no attempt was possible')}.",
+                   nid=f"intouch-{shift['start']}")
+            return
+        if not (opens <= now and cfg["auto_book_on"]):
+            return
+        if not st.get("opened_notified"):
+            notify("InTouch book-on window open",
+                   f"{label} shift: I'll keep trying to book you on until {closes:%H:%M}.",
+                   nid=f"intouch-{shift['start']}")
+            st["opened_notified"] = True
+        last = st.get("last_attempt")
+        if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < cfg["retry_every_min"] * 60:
+            return
+        st["last_attempt"] = now.isoformat(timespec="seconds")
+        st["attempts"] += 1
+        if not self.link(cfg, force=True):
+            outcome, detail = "error", "phone-control link is down"
+        else:
+            outcome, detail = book_on_once(cfg, shift=shift)
+        st["last_outcome"], st["last_detail"] = outcome, detail
+        log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
+        if outcome in ("booked", "already"):
+            st["status"] = outcome
+            notify("Booked on ✔", f"InTouch: you're booked on for the {label} shift ({now:%H:%M}).",
+                   nid=f"intouch-{shift['start']}")
+        elif outcome == "locked" and not st.get("locked_notified"):
+            notify("Unlock your phone", f"I need the phone unlocked to book you on for {label}. "
+                   f"Retrying every {cfg['retry_every_min']} min until {closes:%H:%M}.", nid="intouch-unlock")
+            st["locked_notified"] = True
+        elif outcome == "error" and not st.get("error_notified"):
+            notify("Auto book-on problem", f"{detail[:150]} -- still retrying until {closes:%H:%M}.",
+                   nid=f"intouch-{shift['start']}")
+            st["error_notified"] = True
+
+
 def daemon(cfg: dict) -> None:
+    import traceback
+
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log("service started")
-    state = load_json(STATE_FILE, {"checks": {}, "shifts": {}})
-    state.setdefault("checks", {})
-    state.setdefault("shifts", {})
-    startup_pending = True
-    last_check_try = 0.0
+    me = Path(__file__).resolve()
+    sources = [me, me.parents[2] / "phone-control" / "scripts" / "phone.py"]
+    stamp = [p.stat().st_mtime for p in sources if p.exists()]
+    svc = _Service()
     while True:
-        cfg = config()
-        now = dt.datetime.now()
-        # 1. schedule reads: once at start-up, then at each check time (overdue slots collapse
-        #    into a single read). A failed/locked read is retried every 10 minutes.
-        due = [f"{now:%Y-%m-%d} {h}" for h in cfg["check_times"]
-               if now.strftime("%H:%M") >= h and not state["checks"].get(f"{now:%Y-%m-%d} {h}")]
-        if (startup_pending or due) and time.time() - last_check_try >= 600 and not _in_any_window(cfg, now):
-            last_check_try = time.time()
-            try:
-                phone.ensure_connected()
-                if ensure_awake_unlocked() == "locked":
-                    log("schedule read postponed: phone locked")
-                else:
-                    refresh_schedule(cfg)
-                    for key in due:
-                        state["checks"][key] = now.isoformat(timespec="minutes")
-                    startup_pending = False
-                    state["checks"] = {k: v for k, v in state["checks"].items()
-                                       if k[:10] >= f"{now - dt.timedelta(days=7):%Y-%m-%d}"}
-                    save_json(STATE_FILE, state)
-            except PhoneError as exc:
-                log(f"schedule read failed: {exc}")
-        # 2. book-on windows
-        sched = load_json(SCHEDULE_FILE, [])
-        for shift in sched:
-            opens, closes = window(shift, cfg)
-            st = state["shifts"].setdefault(shift["start"], {"status": "pending", "attempts": 0})
-            if st["status"] in ("booked", "missed", "already"):
-                continue
-            if opens <= now <= closes and cfg["auto_book_on"]:
-                if not st.get("opened_notified"):
-                    notify("InTouch book-on window open",
-                           f"Shift at {shift['start'][11:]}: trying to book you on until {closes:%H:%M}.")
-                    st["opened_notified"] = True
-                last = st.get("last_attempt")
-                if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < cfg["retry_every_min"] * 60:
-                    continue
-                st["last_attempt"] = now.isoformat(timespec="seconds")
-                st["attempts"] += 1
-                try:
-                    phone.ensure_connected()
-                    outcome, detail = book_on_once(cfg)
-                except PhoneError as exc:
-                    outcome, detail = "error", str(exc)
-                st["last_outcome"], st["last_detail"] = outcome, detail
-                log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
-                if outcome in ("booked", "already"):
-                    st["status"] = outcome
-                    notify("Booked on ✔", f"InTouch: booked on for the {shift['start'][11:]} shift at {now:%H:%M}.")
-                elif outcome == "locked" and not st.get("locked_notified"):
-                    notify("Unlock your phone", "I need the phone unlocked to book you on in InTouch.")
-                    st["locked_notified"] = True
-                elif outcome == "error" and not st.get("error_notified"):
-                    notify("InTouch auto book-on has a problem",
-                           f"{detail[:150]} -- still retrying until {closes:%H:%M}.")
-                    st["error_notified"] = True
-            elif now > closes and st["status"] == "pending":
-                st["status"] = "missed"
-                notify("NOT booked on ✖",
-                       f"The book-on window for your {shift['start'][11:]} shift closed. Book on by hand "
-                       f"or tell your manager. Last result: {st.get('last_outcome', 'no attempt')}.")
-            save_json(STATE_FILE, state)
+        try:
+            svc.tick()
+        except Exception as exc:  # never let one bad tick stop the service
+            log(f"service error (continuing): {exc!r}\n" + traceback.format_exc(limit=4))
         time.sleep(30)
+        try:  # updated code (skills sync) -> re-exec in place: same pid, same app context
+            if [p.stat().st_mtime for p in sources if p.exists()] != stamp:
+                log("code updated -- restarting the service onto it")
+                os.execv(sys.executable, [sys.executable, str(me), "daemon"])
+        except OSError as exc:
+            log(f"self-restart check failed: {exc}")
 
 
 def _in_any_window(cfg: dict, now: dt.datetime) -> bool:
@@ -615,10 +834,48 @@ def _in_any_window(cfg: dict, now: dt.datetime) -> bool:
 def daemon_pid() -> int | None:
     try:
         pid = int(PID_FILE.read_text())
-        os.kill(pid, 0)
-        return pid
     except (OSError, ValueError):
         return None
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        pass  # alive, but started from another security context (e.g. adb run-as vs the app)
+    except OSError:
+        return None
+    try:  # guard against a recycled pid
+        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+        if b"intouch.py" not in cmdline:
+            return None
+    except OSError:
+        pass
+    return pid
+
+
+WATCHDOG_JOB_ID = 4242
+WATCHDOG_SCRIPT = STATE_DIR / "watchdog.sh"
+
+
+def install_watchdog() -> str:
+    """Android JobScheduler job (via Termux:API): every 15 min, and after a reboot, start the
+    service if it is not running. Persisted, so it survives restarts."""
+    if not shutil.which("termux-job-scheduler"):
+        raise SystemExit("termux-job-scheduler missing: pkg install termux-api (and the Termux:API app)")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    WATCHDOG_SCRIPT.write_text(
+        "#!/data/data/com.termux/files/usr/bin/sh\n"
+        f"exec python {Path(__file__).resolve()} ensure >> {STATE_DIR / 'watchdog.out'} 2>&1\n")
+    WATCHDOG_SCRIPT.chmod(0o755)
+    out = subprocess.run(["termux-job-scheduler", "--job-id", str(WATCHDOG_JOB_ID), "--script", str(WATCHDOG_SCRIPT),
+                          "--period-ms", "900000", "--persisted", "true", "--battery-not-low", "false"],
+                         capture_output=True, text=True, timeout=30)
+    return (out.stdout + out.stderr).strip() or "watchdog scheduled"
+
+
+def ensure() -> None:
+    if daemon_pid():
+        return
+    log("watchdog: service was not running -- starting it")
+    start()
 
 
 def start() -> None:
@@ -652,7 +909,8 @@ def stop() -> None:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="intouch.py", description=__doc__.split("\n")[0])
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("status", "shifts", "calendar", "refresh", "schedule", "start", "stop", "daemon"):
+    for name in ("status", "shifts", "calendar", "refresh", "schedule", "start", "stop", "daemon",
+                 "ensure", "install-watchdog", "remove-watchdog", "reconnect"):
         sub.add_parser(name)
     a = sub.add_parser("add-shift")
     a.add_argument("date")
@@ -711,7 +969,8 @@ def main(argv: list[str] | None = None) -> int:
             save_json(SCHEDULE_FILE, sched)
             print(json.dumps(sched, indent=2))
         elif args.cmd == "book-on":
-            outcome, detail = book_on_once(cfg, dry_run=args.dry_run)
+            nxt = next_shift(load_json(SCHEDULE_FILE, []), cfg)
+            outcome, detail = book_on_once(cfg, dry_run=args.dry_run, shift=nxt)
             log(f"manual book-on: {outcome} -- {detail}")
             print(json.dumps({"outcome": outcome, "detail": detail}, indent=2))
         elif args.cmd == "set-password":
@@ -735,6 +994,15 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "reset-login":
             LOGIN_BLOCK_FILE.unlink(missing_ok=True)
             print("Auto-login allowed again.")
+        elif args.cmd == "ensure":
+            ensure()
+        elif args.cmd == "install-watchdog":
+            print(install_watchdog())
+        elif args.cmd == "remove-watchdog":
+            subprocess.run(["termux-job-scheduler", "--cancel", "--job-id", str(WATCHDOG_JOB_ID)], timeout=30)
+            print("watchdog removed")
+        elif args.cmd == "reconnect":
+            print("phone-control link: " + ("OK" if reconnect_adb() else "still down (see phone-control Setup)"))
         elif args.cmd == "start":
             start()
         elif args.cmd == "stop":
