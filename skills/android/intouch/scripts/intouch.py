@@ -839,6 +839,9 @@ class _Service:
         self.last_read_try = time.time()
         if not self.link(cfg, force=True):
             return False
+        if user_is_busy(cfg):
+            log(f"schedule read ({why}) postponed: you're using the phone")
+            return False
         try:
             if ensure_awake_unlocked() == "locked":
                 log(f"schedule read ({why}) postponed: phone locked")

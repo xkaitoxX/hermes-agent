@@ -254,6 +254,19 @@ def test_password_manager_sheet_is_recognised(intouch):
     assert intouch._is_autofill_sheet(login_form) is False
 
 
+@pytest.mark.parametrize("awake, locked, fg, busy", [
+    (True, False, "com.android.settings/com.android.settings.SubSettings", True),
+    (True, False, "com.zte.mifavor.launcher/com.android.launcher3.uioverrides.QuickstepLauncher", False),
+    (True, True, "com.android.systemui/.NotificationShade", False),
+    (False, False, "com.whatsapp/.Main", False),
+    (True, False, "com.mitie.InTouch/crc6493f6d9cfde9a7df8.MainActivity", False),
+])
+def test_user_is_busy(intouch, monkeypatch, awake, locked, fg, busy):
+    monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": awake, "locked": locked})
+    monkeypatch.setattr(intouch.phone, "foreground", lambda: fg)
+    assert intouch.user_is_busy(intouch.DEFAULTS) is busy
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone
