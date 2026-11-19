@@ -205,8 +205,10 @@ def relock_if_we_unlocked() -> None:
         try:
             phone.shell("input keyevent 3")
             time.sleep(0.5)
-            phone.lock()
-            log("locked the phone again")
+            if phone.lock():
+                log("locked the phone again")
+            else:
+                log("screen off; the phone locks after its lock-screen delay")
         except PhoneError as exc:
             log(f"could not lock the phone again: {exc}")
 

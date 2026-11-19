@@ -361,9 +361,18 @@ def unlock() -> str:
                      "Android's lockout; unlock by hand, check the saved PIN, then run: phone.py reset-unlock")
 
 
-def lock() -> None:
-    """Turn the screen off; with the default 'power button instantly locks' this locks the phone."""
-    shell("input keyevent 223")
+def lock() -> bool:
+    """Lock the phone now. The POWER key (not SLEEP) honours 'power button instantly locks', so
+    there is no unlocked-but-dark gap of the lock-after-timeout delay. Returns True once locked."""
+    if screen_state()["awake"]:
+        shell("input keyevent 26")
+    else:
+        shell("input keyevent 223")
+    for _ in range(6):
+        time.sleep(0.5)
+        if screen_state()["locked"]:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------- actions
