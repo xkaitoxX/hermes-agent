@@ -47,7 +47,9 @@ fi
 echo "== Fetching fork $FORK_URL ($FORK_BRANCH) into $SRC"
 if [ -d "$SRC/.git" ]; then
   git -C "$SRC" fetch --depth 1 origin "$FORK_BRANCH"
-  git -C "$SRC" checkout -q -B "$FORK_BRANCH" FETCH_HEAD
+  # The phone checkout is install-only: discard local edits so an update never stalls on them.
+  git -C "$SRC" checkout -q -f -B "$FORK_BRANCH" FETCH_HEAD
+  git -C "$SRC" clean -q -fd
 else
   git clone --depth 1 --branch "$FORK_BRANCH" "$FORK_URL" "$SRC"
 fi
