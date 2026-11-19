@@ -405,12 +405,25 @@ def goto_tab(index: int) -> list[dict]:
     return screen()
 
 
+def open_tab(cfg: dict, index: int) -> list[dict]:
+    """Open InTouch on tab ``index``. InTouch sometimes flashes its tabs and then throws up
+    another prompt, so the whole open+switch is retried a few times."""
+    last: PhoneError | None = None
+    for _ in range(3):
+        try:
+            open_intouch(cfg)
+            elems = goto_tab(index)
+            if _on_main_tabs(elems):
+                return elems
+        except PhoneError as exc:
+            last = exc
+            log(f"tab {TAB_TITLES[index]} not reached ({exc}); retrying")
+        time.sleep(2)
+    raise last or PhoneError(f"Could not open InTouch's {TAB_TITLES[index]} tab.")
+
+
 def read_shift_list(cfg: dict) -> tuple[list[str], list[dict]]:
-    open_intouch(cfg)
-    elems = goto_tab(0)
-    if not _on_main_tabs(elems):  # the app threw something up while switching tabs
-        open_intouch(cfg)
-        elems = goto_tab(0)
+    elems = open_tab(cfg, 0)
     refresh = _labels_hit(elems, ["refresh"])
     if refresh:
         phone.tap_xy(*refresh["center"])
@@ -421,11 +434,7 @@ def read_shift_list(cfg: dict) -> tuple[list[str], list[dict]]:
 
 
 def read_calendar(cfg: dict, months: int = 2) -> list[str]:
-    open_intouch(cfg)
-    elems = goto_tab(1)
-    if not _on_main_tabs(elems):
-        open_intouch(cfg)
-        elems = goto_tab(1)
+    elems = open_tab(cfg, 1)
     out: list[str] = []
     for m in range(months):
         out += [t for t in _texts(elems) if t not in TAB_TITLES and t not in out]
