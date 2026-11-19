@@ -929,8 +929,9 @@ def install_watchdog() -> str:
         f"exec python {Path(__file__).resolve()} ensure >> {STATE_DIR / 'watchdog.out'} 2>&1\n")
     WATCHDOG_SCRIPT.chmod(0o755)
     out = subprocess.run(["termux-job-scheduler", "--job-id", str(WATCHDOG_JOB_ID), "--script", str(WATCHDOG_SCRIPT),
-                          "--period-ms", "900000", "--persisted", "true", "--battery-not-low", "false",
-                          "--network", "none"],
+                          "--period-ms", "900000", "--persisted", "true", "--battery-not-low", "false"],
+                         # (--network none silently drops the job on Termux:API 0.53; the default
+                         #  "any network" is fine -- a book-on needs the internet anyway)
                          capture_output=True, text=True, timeout=30)
     return (out.stdout + out.stderr).strip() or "watchdog scheduled"
 
