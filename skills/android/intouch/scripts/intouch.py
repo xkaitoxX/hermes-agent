@@ -119,14 +119,25 @@ def _texts(elems: list[dict]) -> list[str]:
     return out
 
 
+def _area(e: dict) -> int:
+    b = e.get("bounds") or [0, 0, 0, 0]
+    return max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+
+
 def _labels_hit(elems: list[dict], labels: list[str], clickable_only: bool = True) -> dict | None:
+    """Best element whose label matches: visible text beats a content-description, then the
+    smallest element wins -- InTouch's fingerprint prompt has a full-screen background described
+    'Cancel' that does nothing, besides the real CANCEL button."""
+    hits = []
     for e in elems:
         if clickable_only and not e["clickable"]:
             continue
         label = (e["text"] or e["desc"] or "").strip().lower()
         if label and any(label == l or re.search(r"\b" + re.escape(l) + r"\b", label) for l in labels):
-            return e
-    return None
+            hits.append(e)
+    if not hits:
+        return None
+    return min(hits, key=lambda e: (not e["text"], _area(e) or 10**9))
 
 
 def screen() -> list[dict]:
@@ -189,25 +200,51 @@ def login(cfg: dict, elems: list[dict]) -> None:
     if any(ord(c) > 126 or ord(c) < 32 for c in secret):
         raise PhoneError("The saved password has a character the phone's typing command cannot enter "
                          "(non-ASCII such as £ or an accent). Log in by hand, or change the password.")
-    phone.tap_xy(*pwd["center"])
-    time.sleep(0.8)
-    _clear_field()
-    phone.shell(_type_command(secret))
-    time.sleep(0.8)
+    # Type, then verify before submitting: only the LENGTH of what landed in the field is
+    # compared, so a mistyped password is never sent (InTouch locks after 3 rejected logins).
+    # InTouch sometimes throws a fingerprint prompt over the form mid-way, stealing focus, so
+    # typing is retried up to 3 times; LOGIN is pressed only after a verified fill.
+    typed_ok = False
+    landed = 0
+    for _attempt in range(3):
+        elems = screen()
+        low = " ".join(_texts(elems)).lower()
+        if "fingerprint" in low or "biometric" in low:
+            cancel = _labels_hit(elems, ["cancel", "use password", "not now"])
+            if cancel:
+                phone.tap_xy(*cancel["center"])
+            time.sleep(1.5)
+            continue
+        fields = [e for e in elems if "EditText" in e["cls"]]
+        pwd_now = next((e for e in fields if e["password"] or "password" in (e["text"] + e["desc"]).lower()),
+                       None) or next((e for e in fields if e["center"] == pwd["center"]), None)
+        if pwd_now is None:
+            time.sleep(1.5)
+            continue
+        phone.tap_xy(*pwd_now["center"])
+        time.sleep(1.0)
+        _clear_field()
+        phone.shell(_type_command(secret))
+        time.sleep(1.0)
+        elems = screen()
+        fields = [e for e in elems if "EditText" in e["cls"]]
+        field = next((e for e in fields if e["center"] == pwd_now["center"]), None) or (fields[-1] if fields else None)
+        typed = (field or {}).get("text", "")
+        landed = 0 if typed.strip().lower() == "password" else len(typed)
+        if landed == len(secret):
+            typed_ok = True
+            break
+        if field is not None:
+            _clear_field(field)
+        time.sleep(1.0)
+    if not typed_ok:
+        raise PhoneError(f"Password typing check failed ({landed} of {len(secret)} characters landed); "
+                         "nothing was submitted. Will retry on the next attempt.")
     phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
     time.sleep(1.0)
     elems = screen()
-    # Verify before submitting: only the LENGTH of what landed in the field is compared, so a
-    # mistyped password is never sent (InTouch locks after 3 rejected logins).
-    fields = [e for e in elems if "EditText" in e["cls"]]
-    pwd_now = next((e for e in fields if e["center"] == pwd["center"]), None) or (fields[-1] if fields else None)
-    typed = (pwd_now or {}).get("text", "")
-    if typed.strip().lower() == "password":
-        typed = ""
-    if len(typed) != len(secret):
-        _clear_field(pwd)
-        raise PhoneError(f"Password typing check failed ({len(typed)} of {len(secret)} characters landed); "
-                         "nothing was submitted. Log in by hand this time.")
+    if not any("EditText" in e["cls"] for e in elems):  # BACK left the form -- don't press blindly
+        raise PhoneError("Login form disappeared before submitting; nothing was submitted.")
     button = _labels_hit(elems, ["login", "log in", "sign in"]) or button
     phone.tap_xy(*button["center"])
     log("login submitted")
@@ -866,7 +903,8 @@ def install_watchdog() -> str:
         f"exec python {Path(__file__).resolve()} ensure >> {STATE_DIR / 'watchdog.out'} 2>&1\n")
     WATCHDOG_SCRIPT.chmod(0o755)
     out = subprocess.run(["termux-job-scheduler", "--job-id", str(WATCHDOG_JOB_ID), "--script", str(WATCHDOG_SCRIPT),
-                          "--period-ms", "900000", "--persisted", "true", "--battery-not-low", "false"],
+                          "--period-ms", "900000", "--persisted", "true", "--battery-not-low", "false",
+                          "--network", "none"],
                          capture_output=True, text=True, timeout=30)
     return (out.stdout + out.stderr).strip() or "watchdog scheduled"
 

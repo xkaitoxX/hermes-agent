@@ -207,6 +207,18 @@ def test_a_crashing_tick_does_not_stop_the_service(intouch, service, monkeypatch
     assert len(ticks) == 3  # kept looping after each error
 
 
+def test_fingerprint_prompt_picks_the_real_cancel_button(intouch):
+    # Exact shape of InTouch's prompt as dumped from the phone.
+    elems = [
+        {"text": "", "desc": "Cancel", "clickable": True, "bounds": [0, 0, 1216, 2688], "center": [608, 1344]},
+        {"text": "", "desc": "", "clickable": True, "bounds": [0, 907, 1216, 2688], "center": [608, 1797]},
+        {"text": "Place your finger on the device fingerprint reader to login", "desc": "", "clickable": False,
+         "bounds": [13, 1643, 1203, 1718], "center": [608, 1680]},
+        {"text": "CANCEL", "desc": "", "clickable": True, "bounds": [364, 2409, 852, 2539], "center": [608, 2474]},
+    ]
+    assert intouch._labels_hit(elems, ["cancel"])["center"] == [608, 2474]
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone
