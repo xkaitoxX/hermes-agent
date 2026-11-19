@@ -845,7 +845,10 @@ class _Service:
                    nid=f"intouch-{shift['start']}")
             st["opened_notified"] = True
         last = st.get("last_attempt")
-        if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < cfg["retry_every_min"] * 60:
+        # While the phone is locked, look again every ~20 s (a cheap check) so the book-on
+        # happens within seconds of the user unlocking; otherwise every retry_every_min.
+        gap = 20 if st.get("last_outcome") == "locked" else cfg["retry_every_min"] * 60
+        if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
             return
         st["last_attempt"] = now.isoformat(timespec="seconds")
         st["attempts"] += 1
@@ -854,15 +857,23 @@ class _Service:
         else:
             outcome, detail = book_on_once(cfg, shift=shift)
         st["last_outcome"], st["last_detail"] = outcome, detail
-        log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
+        if outcome == "locked":
+            st["attempts"] -= 1  # a locked-screen check is not a book-on attempt
+            if st.get("last_logged") != "locked":
+                log(f"book-on for {shift['start']}: phone locked -- checking every 20 s until unlocked")
+        else:
+            log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
+        st["last_logged"] = outcome
         if outcome in ("booked", "already"):
             st["status"] = outcome
             notify("Booked on ✔", f"InTouch: you're booked on for the {label} shift ({now:%H:%M}).",
                    nid=f"intouch-{shift['start']}")
-        elif outcome == "locked" and not st.get("locked_notified"):
-            notify("Unlock your phone", f"I need the phone unlocked to book you on for {label}. "
-                   f"Retrying every {cfg['retry_every_min']} min until {closes:%H:%M}.", nid="intouch-unlock")
-            st["locked_notified"] = True
+        elif outcome == "locked":
+            last_alert = st.get("locked_notified_at")
+            if not last_alert or (now - dt.datetime.fromisoformat(last_alert)).total_seconds() >= 360:
+                notify("Unlock your phone", f"Unlock it and I'll book you on for {label} straight away "
+                       f"(window closes {closes:%H:%M}).", nid="intouch-unlock")
+                st["locked_notified_at"] = now.isoformat(timespec="seconds")
         elif outcome == "error" and not st.get("error_notified"):
             notify("Auto book-on problem", f"{detail[:150]} -- still retrying until {closes:%H:%M}.",
                    nid=f"intouch-{shift['start']}")

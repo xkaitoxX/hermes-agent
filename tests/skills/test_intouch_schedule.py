@@ -195,6 +195,31 @@ def test_two_shifts_in_one_day_are_booked_independently(intouch, service, monkey
     assert all(svc.state["shifts"][s["start"]]["status"] == "booked" for s in (a, b))
 
 
+def test_locked_phone_is_rechecked_fast_and_books_soon_after_unlock(intouch, service, monkeypatch):
+    svc, sent = service
+    shift = {"start": "2026-11-20T08:00", "end": None}
+    # Locked for the first ~3 minutes of the window, then unlocked and InTouch accepts.
+    unlock_at = dt.datetime(2026, 11, 20, 7, 48)
+    clock = {"t": None}
+    calls = []
+
+    def fake_book_on(cfg, shift=None):
+        calls.append(clock["t"])
+        return ("locked", "phone is locked") if clock["t"] < unlock_at else ("booked", "ok")
+
+    monkeypatch.setattr(intouch, "book_on_once", fake_book_on)
+    t = dt.datetime(2026, 11, 20, 7, 45)
+    while t <= dt.datetime(2026, 11, 20, 7, 52):
+        clock["t"] = t
+        svc.handle_shift(shift, intouch.DEFAULTS, t)
+        t += dt.timedelta(seconds=10)
+    st = svc.state["shifts"][shift["start"]]
+    assert st["status"] == "booked"
+    assert calls[-1] - unlock_at <= dt.timedelta(seconds=30)   # booked within 30 s of unlocking
+    assert st["attempts"] == 1                                  # locked checks are not counted
+    assert sent.count("Unlock your phone") == 1                 # one alert in the first 6 minutes
+
+
 def test_a_crashing_tick_does_not_stop_the_service(intouch, service, monkeypatch):
     svc, _ = service
     monkeypatch.setattr(svc, "tick", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
