@@ -148,6 +148,21 @@ def screen() -> list[dict]:
 _UNLOCKED_BY_US = False
 
 
+def user_is_busy(cfg: dict) -> bool:
+    """True when the screen is on, unlocked and showing some other app -- someone is using the phone.
+    Routine schedule reads wait for an idle phone (locked, off, or on the home screen) instead of
+    taking over the screen. Book-on attempts don't wait: that is the job the user asked for."""
+    try:
+        st = phone.screen_state()
+        if not st["awake"] or st["locked"]:
+            return False
+        fg = phone.foreground().lower()
+    except PhoneError:
+        return False
+    idle = ("launcher", "systemui", cfg["package"].lower(), "com.termux")
+    return not any(s in fg for s in idle)
+
+
 def ensure_awake_unlocked() -> str:
     """'ok' | 'locked'. Wakes the screen; if the phone is locked and the user saved an unlock PIN
     (and auto_unlock is on) unlocks it -- remembering to lock it again afterwards (relock_if_we_unlocked)."""
