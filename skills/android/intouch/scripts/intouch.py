@@ -835,7 +835,7 @@ class _Service:
         self.state.setdefault("shifts", {})
         # Only a first-ever start reads at once. After a restart (watchdog, reboot, code update)
         # the missed check times -- kept in state.json -- decide whether a read is due.
-        self.startup_pending = not self.state.get("last_read_ok")
+        self.startup_pending = not (self.state.get("last_read_ok") or self.state["checks"])
         self.link_ok = True
         self.last_link_check = 0.0
         self.link_alerted_at = 0.0
