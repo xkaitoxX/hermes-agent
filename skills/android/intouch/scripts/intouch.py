@@ -222,7 +222,8 @@ def login(cfg: dict, elems: list[dict]) -> None:
             time.sleep(1.5)
             continue
         phone.tap_xy(*pwd_now["center"])
-        time.sleep(1.0)
+        time.sleep(1.5)
+        _dismiss_autofill_sheet()
         _clear_field()
         phone.shell(_type_command(secret))
         time.sleep(1.0)
@@ -298,6 +299,28 @@ def _type_command(text: str) -> str:
     return "; ".join(parts)
 
 
+def _is_autofill_sheet(elems: list[dict]) -> bool:
+    low = " ".join(_texts(elems)).lower()
+    return "saved password" in low or ("no, thanks" in low and "continue" in low)
+
+
+def _dismiss_autofill_sheet() -> bool:
+    """Android's password manager ("Use your saved password for InTouch?") pops up when the password
+    field is tapped and grabs the keyboard, so typed characters go nowhere. Dismiss it."""
+    elems = screen()
+    if not _is_autofill_sheet(elems):
+        return False
+    no = _labels_hit(elems, ["no, thanks", "no thanks", "not now", "dismiss"])
+    if no:
+        phone.tap_xy(*no["center"])
+        log("dismissed the password-manager prompt")
+        time.sleep(1.2)
+        return True
+    phone.shell("input keyevent 4")
+    time.sleep(1.2)
+    return True
+
+
 def _clear_field(field: dict | None = None) -> None:
     if field is not None:
         phone.tap_xy(*field["center"])
@@ -333,6 +356,9 @@ def open_intouch(cfg: dict) -> list[dict]:
         texts = " ".join(_texts(elems)).lower()
         if _on_main_tabs(elems):
             return elems
+        if _is_autofill_sheet(elems):
+            _dismiss_autofill_sheet()
+            continue
         if "fingerprint" in texts or "biometric" in texts or "touch the sensor" in texts:
             cancel = _labels_hit(elems, ["cancel", "use password", "not now", "no thanks", "skip", "later"])
             if cancel:

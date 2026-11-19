@@ -219,6 +219,16 @@ def test_fingerprint_prompt_picks_the_real_cancel_button(intouch):
     assert intouch._labels_hit(elems, ["cancel"])["center"] == [608, 2474]
 
 
+def test_password_manager_sheet_is_recognised(intouch):
+    sheet = [{"text": "Use your saved password for InTouch?", "desc": "", "clickable": False},
+             {"text": "No, thanks", "desc": "", "clickable": True},
+             {"text": "Continue", "desc": "", "clickable": True}]
+    login_form = [{"text": "Login", "desc": "", "clickable": False},
+                  {"text": "LOGIN", "desc": "", "clickable": True}]
+    assert intouch._is_autofill_sheet(sheet) is True
+    assert intouch._is_autofill_sheet(login_form) is False
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone
