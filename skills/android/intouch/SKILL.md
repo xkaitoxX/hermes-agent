@@ -80,4 +80,6 @@ failures) and the user is notified; once they have fixed it they run `intouch.py
 - adb over localhost enabled since the last reboot (`phone.py status` shows connected).
 - Termux:API app installed, with **notifications allowed** for Termux:API.
 - Termux and Termux:API set to **Unrestricted** battery use, so the service is not killed.
-- The phone must be unlocked for a book-on (a locked phone gets a "please unlock" notification).
+- A locked phone: if the user saved an unlock PIN/pattern (phone-control skill) and
+  `auto_unlock` is on, the service unlocks for the job and locks the phone again afterwards;
+  otherwise it rechecks every 20 s and sends "Unlock your phone" notifications.

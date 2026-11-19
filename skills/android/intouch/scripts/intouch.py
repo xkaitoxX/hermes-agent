@@ -62,6 +62,7 @@ DEFAULTS = {
     "retry_every_min": 2,
     "check_times": ["07:00", "13:00", "19:00"],
     "auto_book_on": True,
+    "auto_unlock": True,  # only takes effect once the user saved a PIN (phone.py set-unlock-pin)
     "use_ai_for_schedule": True,
     "ai_command": "hermes-custom --provider deepseek -m deepseek-chat -z",
     "book_on_labels": ["book on", "sign on", "pin on", "clock in", "check in", "start shift", "book in"],
@@ -144,19 +145,51 @@ def screen() -> list[dict]:
     return phone.visible_elements(phone.dump_screen())
 
 
+_UNLOCKED_BY_US = False
+
+
 def ensure_awake_unlocked() -> str:
-    """'ok' | 'locked'. Wakes the screen; never unlocks a secure lock screen."""
+    """'ok' | 'locked'. Wakes the screen; if the phone is locked and the user saved an unlock PIN
+    (and auto_unlock is on) unlocks it -- remembering to lock it again afterwards (relock_if_we_unlocked)."""
+    global _UNLOCKED_BY_US
     st = phone.screen_state()
     if not st["awake"]:
         phone.shell("input keyevent 224")
         time.sleep(1.0)
         st = phone.screen_state()
-    if st["locked"]:
-        phone.shell("wm dismiss-keyguard")  # only succeeds when the lock screen is not secure
-        time.sleep(1.0)
-        if phone.screen_state()["locked"]:
+    if not st["locked"]:
+        return "ok"
+    phone.shell("wm dismiss-keyguard")  # only succeeds when the lock screen is not secure
+    time.sleep(1.0)
+    if not phone.screen_state()["locked"]:
+        return "ok"
+    if config().get("auto_unlock") and phone.pin_saved():
+        try:
+            if phone.unlock() == "unlocked":
+                _UNLOCKED_BY_US = True
+                log("unlocked the phone for the job (will lock it again after)")
+            return "ok"
+        except PhoneError as exc:
+            log(f"automatic unlock failed: {exc}")
+            if phone.UNLOCK_BLOCK_FILE.exists():
+                notify("Automatic unlock stopped", "The saved PIN did not unlock the phone, so automatic "
+                       "unlock is paused (to avoid Android's lockout). Unlock by hand, check the PIN, then "
+                       "run: phone.py reset-unlock", nid="intouch-unlock-failed")
             return "locked"
-    return "ok"
+    return "locked"
+
+
+def relock_if_we_unlocked() -> None:
+    global _UNLOCKED_BY_US
+    if _UNLOCKED_BY_US:
+        _UNLOCKED_BY_US = False
+        try:
+            phone.shell("input keyevent 3")
+            time.sleep(0.5)
+            phone.lock()
+            log("locked the phone again")
+        except PhoneError as exc:
+            log(f"could not lock the phone again: {exc}")
 
 
 LOGIN_ERROR_WORDS = ("failed", "incorrect", "invalid", "locked", "not match", "wrong", "error",
@@ -703,6 +736,7 @@ def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) ->
             phone.shell("input keyevent 3")
         except PhoneError:
             pass
+        relock_if_we_unlocked()
 
 
 # ---------------------------------------------------------------- phone-control link
@@ -791,6 +825,8 @@ class _Service:
         except PhoneError as exc:
             log(f"schedule read ({why}) failed: {exc}")
             return False
+        finally:
+            relock_if_we_unlocked()
 
     def tick(self) -> None:
         cfg = config()

@@ -43,6 +43,8 @@ SERIAL = os.environ.get("PHONE_ADB_SERIAL", "127.0.0.1:5555")
 STATE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "phone-control"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "phone-control"
 LAST_SCREEN = STATE_DIR / "last_screen.json"
+PIN_FILE = CONFIG_DIR / "unlock-pin"              # written only by `set-unlock-pin` (the user types it)
+UNLOCK_BLOCK_FILE = STATE_DIR / "unlock_blocked"  # present after a failed unlock: no more tries
 DEFAULT_BLOCKLIST = [
     r"\blog ?out\b", r"\bsign ?out\b", r"\bdelete\b", r"\buninstall\b", r"\bfactory reset\b",
     r"\berase\b", r"\bremove account\b", r"\bpay now\b", r"\bbuy\b", r"\bpurchase\b",
@@ -235,6 +237,117 @@ def screen_state() -> dict:
     }
 
 
+# ---------------------------------------------------------------- lock screen
+def pin_saved() -> bool:
+    return PIN_FILE.exists()
+
+
+def _read_pin() -> str | None:
+    """The saved secret: 'pattern:<digits 1-9>' for a pattern, otherwise a PIN or password."""
+    try:
+        pin = PIN_FILE.read_text().strip()
+    except OSError:
+        return None
+    return pin or None
+
+
+def _pattern_points(seq: str, bounds: list[int]) -> list[tuple[int, int]]:
+    """Centres of the 3x3 pattern dots (1 = top-left ... 9 = bottom-right) inside ``bounds``."""
+    x1, y1, x2, y2 = bounds
+    cw, ch = (x2 - x1) / 3, (y2 - y1) / 3
+    pts = []
+    for d in seq:
+        i = int(d) - 1
+        pts.append((int(x1 + cw * (i % 3) + cw / 2), int(y1 + ch * (i // 3) + ch / 2)))
+    return pts
+
+
+def _draw_pattern(seq: str, bounds: list[int]) -> None:
+    pts = _pattern_points(seq, bounds)
+    cmds = [f"input motionevent DOWN {pts[0][0]} {pts[0][1]}"]
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        for k in range(1, 6):  # interpolate so every dot on the way registers
+            cmds.append(f"input motionevent MOVE {int(ax + (bx - ax) * k / 5)} {int(ay + (by - ay) * k / 5)}")
+    cmds.append(f"input motionevent UP {pts[-1][0]} {pts[-1][1]}")
+    shell("; ".join(cmds))
+
+
+def unlock() -> str:
+    """Unlock the phone with the PIN the user saved (``set-unlock-pin``). Returns 'already' | 'unlocked'.
+
+    One PIN entry per call, verified afterwards; a failed entry blocks further automatic unlocks
+    (Android throttles and may wipe after repeated wrong PINs) until ``reset-unlock``. The PIN is
+    never printed or logged. Agents must not call this to get into the phone on their own: it is for
+    the user's own scheduled automations.
+    """
+    state = screen_state()
+    if not state["awake"]:
+        shell("input keyevent 224")
+        time.sleep(1.0)
+        state = screen_state()
+    if not state["locked"]:
+        return "already"
+    if UNLOCK_BLOCK_FILE.exists():
+        raise PhoneError("Automatic unlock is paused after a failed attempt. Unlock by hand once, then "
+                         "run: phone.py reset-unlock")
+    secret = _read_pin()
+    if not secret:
+        raise PhoneError("Phone is locked and no unlock PIN/password/pattern is saved "
+                         "(phone.py set-unlock-pin or set-unlock-pattern).")
+    pattern = secret[8:] if secret.startswith("pattern:") else None
+    if pattern is None and any(ord(c) > 126 or ord(c) < 33 for c in secret):
+        raise PhoneError("The saved unlock PIN/password has characters that cannot be typed automatically.")
+    size = shell("wm size")
+    m = re.search(r"(\d+)x(\d+)", size)
+    w, h = (int(m.group(1)), int(m.group(2))) if m else (1080, 2400)
+    kind, pattern_bounds = None, None
+    for _ in range(3):  # bring up the bouncer (swipe up on the lock screen)
+        shell(f"input swipe {w // 2} {int(h * 0.82)} {w // 2} {int(h * 0.30)} 250")
+        time.sleep(1.3)
+        if not screen_state()["locked"]:
+            return "unlocked"  # face unlock or a non-secure lock got there first
+        nodes = dump_screen()
+        descs = {n["desc"].lower() for n in nodes}
+        patt = next((n for n in nodes if "pattern" in (n["cls"] + n["id"] + n["desc"]).lower()
+                     and n["bounds"][2] - n["bounds"][0] > 200), None)
+        if patt is not None:
+            kind, pattern_bounds = "pattern", patt["bounds"]
+            break
+        if "pin area" in descs or {"1", "2", "3"} <= {n["desc"] for n in nodes}:
+            kind = "pin"
+            break
+        if any("EditText" in n["cls"] for n in nodes if n["pkg"].startswith("com.android.systemui")):
+            kind = "password"
+            break
+        shell("input keyevent 224")
+        time.sleep(0.8)
+    if kind is None:
+        raise PhoneError("Could not bring up the lock screen's PIN/password/pattern entry.")
+    if (kind == "pattern") != (pattern is not None):
+        raise PhoneError(f"The lock screen asks for a {kind}, but the saved secret is a "
+                         f"{'pattern' if pattern else 'PIN/password'}. Nothing was entered.")
+    if kind == "pattern":
+        _draw_pattern(pattern, pattern_bounds)
+    else:
+        shell("input text " + shlex.quote(secret))
+        time.sleep(0.4)
+        shell("input keyevent 66")
+    for _ in range(8):
+        time.sleep(0.6)
+        if not screen_state()["locked"]:
+            return "unlocked"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    UNLOCK_BLOCK_FILE.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
+    shell("input keyevent 4")
+    raise PhoneError("The phone did not unlock with the saved PIN. Automatic unlock is paused to avoid "
+                     "Android's lockout; unlock by hand, check the saved PIN, then run: phone.py reset-unlock")
+
+
+def lock() -> None:
+    """Turn the screen off; with the default 'power button instantly locks' this locks the phone."""
+    shell("input keyevent 223")
+
+
 # ---------------------------------------------------------------- actions
 def tap_xy(x: int, y: int) -> None:
     shell(f"input tap {int(x)} {int(y)}")
@@ -308,11 +421,49 @@ def main(argv: list[str] | None = None) -> int:
     w = sub.add_parser("wait")
     w.add_argument("--text", required=True)
     w.add_argument("--timeout", type=float, default=15)
+    sub.add_parser("set-unlock-pin", help="save the lock-screen PIN or password (you type it; not echoed)")
+    sub.add_parser("set-unlock-pattern", help="save the lock-screen pattern as dot numbers 1-9 (not echoed)")
+    sub.add_parser("clear-unlock-pin")
+    sub.add_parser("reset-unlock", help="allow automatic unlock again after a failed attempt")
     args = p.parse_args(argv)
 
     try:
         if args.cmd == "connect":
             print(connect())
+            return 0
+        if args.cmd in ("set-unlock-pin", "set-unlock-pattern"):
+            import getpass
+            if not sys.stdin.isatty():
+                raise SystemExit("Run this yourself in the Termux app so you can type it.")
+            if args.cmd == "set-unlock-pattern":
+                print("Number the dots like a keypad: 1 2 3 / 4 5 6 / 7 8 9, and type your pattern's dots "
+                      "in order (e.g. an L shape is 14789).")
+                prompt = "Pattern dots (not shown): "
+            else:
+                prompt = "Lock-screen PIN or password (not shown): "
+            first = getpass.getpass(prompt)
+            again = getpass.getpass("Again to confirm: ")
+            if not first or first != again:
+                raise SystemExit("They did not match; nothing saved.")
+            if args.cmd == "set-unlock-pattern":
+                if not re.fullmatch(r"[1-9]{4,9}", first) or len(set(first)) != len(first):
+                    raise SystemExit("A pattern is 4-9 different dots numbered 1-9; nothing saved.")
+                first = "pattern:" + first
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            os.chmod(CONFIG_DIR, 0o700)
+            fd = os.open(PIN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fh.write(first)
+            UNLOCK_BLOCK_FILE.unlink(missing_ok=True)
+            print(f"Saved (readable only by Termux): {PIN_FILE}")
+            return 0
+        if args.cmd == "clear-unlock-pin":
+            PIN_FILE.unlink(missing_ok=True)
+            print("Saved unlock PIN deleted.")
+            return 0
+        if args.cmd == "reset-unlock":
+            UNLOCK_BLOCK_FILE.unlink(missing_ok=True)
+            print("Automatic unlock allowed again.")
             return 0
         ensure_connected()
         if args.cmd == "status":

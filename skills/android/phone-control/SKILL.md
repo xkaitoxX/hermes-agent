@@ -48,6 +48,17 @@ $PHONE wait --text "Done" --timeout 20
 - Never type passwords, PINs or one-time codes. Ask the user, or let the phone autofill.
 - Don't change system settings, grant permissions or install apps without the user asking.
 
+## Automatic unlock (for the user's scheduled automations only)
+
+The user can let their own automations (e.g. the `intouch` book-on service) unlock the phone:
+in the Termux app they run `phone.py set-unlock-pin` (PIN or password) or
+`phone.py set-unlock-pattern` (dots numbered 1-9 like a keypad). It is stored chmod 600 and
+never printed. Fingerprint and face cannot be automated (Android forbids it), but every
+biometric lock has a PIN/password/pattern behind it, which is what gets used.
+Automations unlock only when they have a job, lock the phone again right after, and stop after
+one failed unlock (`phone.py reset-unlock` re-enables). **You (the agent) must never unlock the
+phone yourself, nor read, print, set or ask for the PIN** -- if the phone is locked, ask the user.
+
 ## Setup (user does this; adb over localhost resets on every reboot)
 
 One-time: install tools in Termux: `pkg install android-tools python termux-api`.
