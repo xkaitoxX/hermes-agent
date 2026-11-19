@@ -26,6 +26,16 @@ if [ ! -x "$PREFIX/lib/hermes-agent/venv/bin/python" ]; then
   pkg install -y hermes-agent
 fi
 
+echo "== Phone tools for the android skills (python, adb, termux-api)"
+missing=""
+command -v python >/dev/null 2>&1 || missing="$missing python"
+command -v adb >/dev/null 2>&1 || missing="$missing android-tools"
+command -v termux-notification >/dev/null 2>&1 || missing="$missing termux-api"
+command -v git >/dev/null 2>&1 || missing="$missing git"
+if [ -n "$missing" ]; then
+  pkg install -y $missing
+fi
+
 echo "== Fetching fork $FORK_URL ($FORK_BRANCH) into $SRC"
 if [ -d "$SRC/.git" ]; then
   git -C "$SRC" fetch --depth 1 origin "$FORK_BRANCH"

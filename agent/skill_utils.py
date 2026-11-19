@@ -98,10 +98,13 @@ def skill_matches_platform_list(platforms: Any) -> bool:
     if not isinstance(platforms, list):
         platforms = [platforms]
     current = sys.platform
+    # Android CPython reports ``android``, but Termux is a Linux userland: a skill tagged
+    # ``linux`` runs there too. Without this, nearly every bundled skill vanished on Android.
+    candidates = (current, "linux") if current == "android" else (current,)
     for platform in platforms:
         normalized = str(platform).lower().strip()
         mapped = PLATFORM_MAP.get(normalized, normalized)
-        if current.startswith(mapped):
+        if any(c.startswith(mapped) for c in candidates):
             return True
     return False
 
