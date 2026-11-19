@@ -93,6 +93,12 @@ def test_login_without_saved_password_asks_user(intouch, tmp_path, monkeypatch):
         intouch.login(intouch.DEFAULTS, [])
 
 
+def test_type_command_types_each_character_exactly(intouch):
+    cmd = intouch._type_command("a b%s'!")
+    assert cmd == ("input text a; input keyevent 62; input text b; input text %; input text s; "
+                   "input text ''\"'\"''; input text '!'")
+
+
 def test_phone_blocklist_refuses_logout():
     sys.path.insert(0, str(ROOT / "skills" / "android" / "phone-control" / "scripts"))
     import phone

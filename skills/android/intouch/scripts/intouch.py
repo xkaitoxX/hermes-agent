@@ -186,17 +186,28 @@ def login(cfg: dict, elems: list[dict]) -> None:
         raise PhoneError("InTouch login form not recognised.")
     if user is not None and not (user["text"] or "").strip():
         raise PhoneError("InTouch login form has no username filled in -- the user must log in by hand once.")
+    if any(ord(c) > 126 or ord(c) < 32 for c in secret):
+        raise PhoneError("The saved password has a character the phone's typing command cannot enter "
+                         "(non-ASCII such as £ or an accent). Log in by hand, or change the password.")
     phone.tap_xy(*pwd["center"])
     time.sleep(0.8)
-    # Clear anything already in the field, then type the secret (adb `input text` escaping).
-    phone.shell("input keyevent KEYCODE_MOVE_END")
-    phone.shell("input keyevent " + " ".join(["KEYCODE_DEL"] * 40))
-    escaped = secret.replace("%", "%%").replace(" ", "%s")
-    phone.shell("input text " + _shell_quote(escaped))
-    time.sleep(0.5)
-    phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
+    _clear_field()
+    phone.shell(_type_command(secret))
     time.sleep(0.8)
+    phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
+    time.sleep(1.0)
     elems = screen()
+    # Verify before submitting: only the LENGTH of what landed in the field is compared, so a
+    # mistyped password is never sent (InTouch locks after 3 rejected logins).
+    fields = [e for e in elems if "EditText" in e["cls"]]
+    pwd_now = next((e for e in fields if e["center"] == pwd["center"]), None) or (fields[-1] if fields else None)
+    typed = (pwd_now or {}).get("text", "")
+    if typed.strip().lower() == "password":
+        typed = ""
+    if len(typed) != len(secret):
+        _clear_field(pwd)
+        raise PhoneError(f"Password typing check failed ({len(typed)} of {len(secret)} characters landed); "
+                         "nothing was submitted. Log in by hand this time.")
     button = _labels_hit(elems, ["login", "log in", "sign in"]) or button
     phone.tap_xy(*button["center"])
     log("login submitted")
@@ -209,6 +220,12 @@ def login(cfg: dict, elems: list[dict]) -> None:
         if any(t.lower() in low for t in TAB_TITLES):
             log("login ok")
             return
+        if "please enter your password" in low or "please enter your email" in low:
+            ok = _labels_hit(elems, ["ok", "close", "dismiss"])
+            if ok:
+                phone.tap_xy(*ok["center"])
+            raise PhoneError("InTouch saw an empty field (typing problem, not a wrong password); "
+                             "nothing counted against the account.")
         if "internet connection" in low or "no connection" in low or "network" in low:
             ok = _labels_hit(elems, ["ok", "close", "dismiss"])
             if ok:
@@ -229,6 +246,27 @@ def login(cfg: dict, elems: list[dict]) -> None:
 def _shell_quote(s: str) -> str:
     import shlex
     return shlex.quote(s)
+
+
+def _type_command(text: str) -> str:
+    """One device-shell command line typing ``text`` exactly, one character at a time.
+
+    ``input text`` turns the two characters ``%s`` into a space and chokes on a bare space, so
+    spaces go as KEYCODE_SPACE and every other printable ASCII character as its own quoted
+    ``input text`` (a lone ``%`` cannot form ``%s``).
+    """
+    parts = []
+    for ch in text:
+        parts.append("input keyevent 62" if ch == " " else "input text " + _shell_quote(ch))
+    return "; ".join(parts)
+
+
+def _clear_field(field: dict | None = None) -> None:
+    if field is not None:
+        phone.tap_xy(*field["center"])
+        time.sleep(0.5)
+    phone.shell("input keyevent KEYCODE_MOVE_END")
+    phone.shell("input keyevent " + " ".join(["KEYCODE_DEL"] * 60))
 
 
 def open_intouch(cfg: dict) -> list[dict]:
