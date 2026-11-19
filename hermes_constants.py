@@ -12,6 +12,28 @@ import sys
 from collections.abc import Callable, Mapping, MutableMapping
 from pathlib import Path
 
+
+def _install_missing_link_shim() -> None:
+    """Android CPython builds omit ``os.link`` entirely (app sandboxes forbid hard links).
+
+    Every publish-by-hard-link site in Hermes already falls back to an exclusive create on
+    ``OSError`` -- the error a filesystem without hard links raises -- but a *missing* function
+    raises ``AttributeError`` instead, which skips those fallbacks and crashes the first turn
+    (``log_hash_salt``). Defining ``os.link`` to raise ``OSError(ENOTSUP)`` routes Android
+    through the existing fallbacks. No-op wherever ``os.link`` exists.
+    """
+    if hasattr(os, "link"):
+        return
+    import errno
+
+    def link(src, dst, *, src_dir_fd=None, dst_dir_fd=None, follow_symlinks=True):
+        raise OSError(errno.ENOTSUP, "hard links are not supported on this platform", str(src), None, str(dst))
+
+    os.link = link
+
+
+_install_missing_link_shim()
+
 _profile_fallback_warned: bool = False
 
 # TUI busy-indicator styles (CLI /indicator, TUI gateway config, /help registry).

@@ -74,6 +74,18 @@ def _gateway_room_grant_secret_for_home(home_value: str) -> bytes:
                 os.link(temporary, path)
             except FileExistsError:
                 material = _read()
+            except OSError:
+                # No hard links (Android app sandbox, exFAT): exclusive create, first writer wins.
+                try:
+                    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                except FileExistsError:
+                    material = _read()
+                else:
+                    with os.fdopen(fd, "wb", closefd=True) as stream:
+                        stream.write(material)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    fsync_directory(home)
             else:
                 fsync_directory(home)
         finally:
