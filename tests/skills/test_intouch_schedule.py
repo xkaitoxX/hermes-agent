@@ -254,6 +254,20 @@ def test_password_manager_sheet_is_recognised(intouch):
     assert intouch._is_autofill_sheet(login_form) is False
 
 
+def test_book_on_waits_during_a_call(intouch, monkeypatch):
+    monkeypatch.setattr(intouch.phone, "in_call", lambda: True)
+    monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
+    touched = []
+    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg: touched.append(1))
+    assert intouch.book_on_once(intouch.DEFAULTS)[0] == "in_call"
+    assert touched == []
+
+
+def test_user_is_busy_during_a_call(intouch, monkeypatch):
+    monkeypatch.setattr(intouch.phone, "in_call", lambda: True)
+    assert intouch.user_is_busy(intouch.DEFAULTS) is True
+
+
 @pytest.mark.parametrize("awake, locked, fg, busy", [
     (True, False, "com.android.settings/com.android.settings.SubSettings", True),
     (True, False, "com.zte.mifavor.launcher/com.android.launcher3.uioverrides.QuickstepLauncher", False),
@@ -262,6 +276,7 @@ def test_password_manager_sheet_is_recognised(intouch):
     (True, False, "com.mitie.InTouch/crc6493f6d9cfde9a7df8.MainActivity", False),
 ])
 def test_user_is_busy(intouch, monkeypatch, awake, locked, fg, busy):
+    monkeypatch.setattr(intouch.phone, "in_call", lambda: False)
     monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": awake, "locked": locked})
     monkeypatch.setattr(intouch.phone, "foreground", lambda: fg)
     assert intouch.user_is_busy(intouch.DEFAULTS) is busy

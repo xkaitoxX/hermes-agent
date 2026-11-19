@@ -153,6 +153,8 @@ def user_is_busy(cfg: dict) -> bool:
     Routine schedule reads wait for an idle phone (locked, off, or on the home screen) instead of
     taking over the screen. Book-on attempts don't wait: that is the job the user asked for."""
     try:
+        if phone.in_call():
+            return True
         st = phone.screen_state()
         if not st["awake"] or st["locked"]:
             return False
@@ -167,6 +169,8 @@ def ensure_awake_unlocked() -> str:
     """'ok' | 'locked'. Wakes the screen; if the phone is locked and the user saved an unlock PIN
     (and auto_unlock is on) unlocks it -- remembering to lock it again afterwards (relock_if_we_unlocked)."""
     global _UNLOCKED_BY_US
+    if phone.in_call():
+        return "in_call"  # never type/tap during a call (keys can become keypad tones)
     st = phone.screen_state()
     if not st["awake"]:
         phone.shell("input keyevent 224")
@@ -684,7 +688,10 @@ def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) ->
     """One attempt for ``shift`` (or the only/first shift shown). Returns (outcome, detail):
     booked | already | not_available | failed | locked | error | dry_run."""
     try:
-        if ensure_awake_unlocked() == "locked":
+        access = ensure_awake_unlocked()
+        if access == "in_call":
+            return "in_call", "a phone call is in progress"
+        if access == "locked":
             return "locked", "phone is locked"
         texts, elems = read_shift_list(cfg)
         # Opportunistically add shifts shown now that the schedule does not know yet.
@@ -858,8 +865,9 @@ class _Service:
             log(f"schedule read ({why}) postponed: you're using the phone")
             return False
         try:
-            if ensure_awake_unlocked() == "locked":
-                log(f"schedule read ({why}) postponed: phone locked")
+            access = ensure_awake_unlocked()
+            if access != "ok":
+                log(f"schedule read ({why}) postponed: {'call in progress' if access == 'in_call' else 'phone locked'}")
                 return False
             refresh_schedule(cfg)
             return True
@@ -924,7 +932,7 @@ class _Service:
         last = st.get("last_attempt")
         # While the phone is locked, look again every ~20 s (a cheap check) so the book-on
         # happens within seconds of the user unlocking; otherwise every retry_every_min.
-        gap = 20 if st.get("last_outcome") == "locked" else cfg["retry_every_min"] * 60
+        gap = 20 if st.get("last_outcome") in ("locked", "in_call") else cfg["retry_every_min"] * 60
         if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
             return
         st["last_attempt"] = now.isoformat(timespec="seconds")
@@ -934,10 +942,10 @@ class _Service:
         else:
             outcome, detail = book_on_once(cfg, shift=shift)
         st["last_outcome"], st["last_detail"] = outcome, detail
-        if outcome == "locked":
-            st["attempts"] -= 1  # a locked-screen check is not a book-on attempt
-            if st.get("last_logged") != "locked":
-                log(f"book-on for {shift['start']}: phone locked -- checking every 20 s until unlocked")
+        if outcome in ("locked", "in_call"):
+            st["attempts"] -= 1  # a locked/in-call check is not a book-on attempt
+            if st.get("last_logged") != outcome:
+                log(f"book-on for {shift['start']}: {detail} -- checking every 20 s")
         else:
             log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
         st["last_logged"] = outcome

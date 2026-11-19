@@ -25,12 +25,17 @@ def fake_phone(tmp_path, monkeypatch):
     monkeypatch.setattr(phone, "UNLOCK_BLOCK_FILE", tmp_path / "unlock_blocked")
     monkeypatch.setattr(phone, "STATE_DIR", tmp_path)
     monkeypatch.setattr(phone.time, "sleep", lambda s: None)
-    sim = {"locked": True, "screen": PIN_PAD, "accept": None, "shell": []}
+    sim = {"locked": True, "screen": PIN_PAD, "accept": None, "shell": [], "call": 0,
+           "focus": "mCurrentFocus=Window{4560a6f u0 NotificationShade}"}
 
     def shell(cmd, timeout=30):
         sim["shell"].append(cmd)
         if cmd.startswith("wm size"):
             return "Physical size: 1216x2688"
+        if "telephony.registry" in cmd:
+            return f"  mCallState={sim['call']}\n"
+        if "mCurrentFocus" in cmd:
+            return sim["focus"]
         if sim["accept"] and sim["accept"] in cmd:
             sim["locked"] = False
         return ""
@@ -86,6 +91,28 @@ def test_pin_saved_but_pattern_screen_enters_nothing(fake_phone):
     with pytest.raises(phone.PhoneError, match="asks for a pattern"):
         phone.unlock()
     assert not any("input text" in c or "motionevent" in c for c in fake_phone["shell"])
+
+
+def _entered_anything(sim) -> bool:
+    return any("input text" in c or "motionevent" in c or "keyevent 66" in c for c in sim["shell"])
+
+
+def test_no_unlock_during_a_call(fake_phone):
+    phone.PIN_FILE.write_text("482915")
+    fake_phone["call"] = 2  # off-hook
+    with pytest.raises(phone.PhoneError, match="call"):
+        phone.unlock()
+    assert not _entered_anything(fake_phone)
+    assert not phone.UNLOCK_BLOCK_FILE.exists()  # a call is not a failed unlock
+
+
+def test_call_screen_in_front_enters_nothing(fake_phone):
+    # The bouncer looked fine, but by typing time the in-call screen is the focused window.
+    phone.PIN_FILE.write_text("482915")
+    fake_phone["focus"] = "mCurrentFocus=Window{1 u0 com.google.android.dialer/com.android.dialer.incall.activity.ui.InCallActivity}"
+    with pytest.raises(phone.PhoneError, match="nothing was entered"):
+        phone.unlock()
+    assert not _entered_anything(fake_phone)
 
 
 def test_pattern_points_grid():

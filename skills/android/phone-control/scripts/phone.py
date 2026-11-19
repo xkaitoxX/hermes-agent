@@ -238,6 +238,19 @@ def screen_state() -> dict:
 
 
 # ---------------------------------------------------------------- lock screen
+def in_call() -> bool:
+    """True while a phone call is ringing or active. Nothing may type or tap then: key presses
+    on the in-call screen can be sent into the call as keypad tones."""
+    out = shell("dumpsys telephony.registry | grep -m 4 mCallState=")
+    return any(v != "0" for v in re.findall(r"mCallState=(\d+)", out))
+
+
+def lockscreen_in_front() -> bool:
+    """The focused window is SystemUI's lock screen / bouncer (shown as NotificationShade)."""
+    out = shell("dumpsys window | grep -m 1 mCurrentFocus")
+    return any(k in out for k in ("NotificationShade", "com.android.systemui", "Keyguard", "Bouncer"))
+
+
 def pin_saved() -> bool:
     return PIN_FILE.exists()
 
@@ -287,6 +300,8 @@ def unlock() -> str:
         state = screen_state()
     if not state["locked"]:
         return "already"
+    if in_call():
+        raise PhoneError("A phone call is in progress; not touching the lock screen.")
     if UNLOCK_BLOCK_FILE.exists():
         raise PhoneError("Automatic unlock is paused after a failed attempt. Unlock by hand once, then "
                          "run: phone.py reset-unlock")
@@ -326,6 +341,9 @@ def unlock() -> str:
     if (kind == "pattern") != (pattern is not None):
         raise PhoneError(f"The lock screen asks for a {kind}, but the saved secret is a "
                          f"{'pattern' if pattern else 'PIN/password'}. Nothing was entered.")
+    if in_call() or not lockscreen_in_front():
+        # A call (or any app) came to the front while the bouncer was opening -- never type into it.
+        raise PhoneError("Something other than the lock screen is in front (call?); nothing was entered.")
     if kind == "pattern":
         _draw_pattern(pattern, pattern_bounds)
     else:
@@ -466,6 +484,10 @@ def main(argv: list[str] | None = None) -> int:
             print("Automatic unlock allowed again.")
             return 0
         ensure_connected()
+        if args.cmd in ("tap", "tap-xy", "type", "key", "swipe", "open") and in_call() \
+                and not getattr(args, "force", False):
+            raise PhoneError("A phone call is in progress -- not tapping or typing (keys can become "
+                             "keypad tones in the call). Try again after the call.")
         if args.cmd == "status":
             st = screen_state()
             print(json.dumps({"adb": SERIAL, "connected": True, **st, "foreground": foreground()}))
