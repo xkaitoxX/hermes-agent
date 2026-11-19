@@ -26,7 +26,9 @@ the user. If the window closes without a book-on it notifies them to do it by ha
 
 - Several shifts a day are handled independently: each attempt anchors on that shift's start
   time on screen and taps the book-on control of that card only.
-- Shifts are re-read at the check times and ~1 hour before every window.
+- Shifts are read only at the check times (3x/day by default). A restart does not trigger a read;
+  a failed read retries at most 3 times (10/20/40 min apart), and the phone is taken over at most
+  `max_reads_per_day` (5) times a day for reads. `pre_window_read` adds a read ~1 h before a window.
 - The service never stops on an error, restarts itself when its code is updated, and the
   watchdog job restarts it if Android kills it or the phone reboots.
 - InTouch is erratic (fingerprint prompts before and/or after the password, random dialogs);

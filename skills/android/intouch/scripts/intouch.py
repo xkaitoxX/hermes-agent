@@ -61,6 +61,13 @@ DEFAULTS = {
     "window_after_min": 15,
     "retry_every_min": 2,
     "check_times": ["07:00", "13:00", "19:00"],
+    # Schedule reads take over the phone, so they are rationed: only at check_times (no extra read
+    # before a window unless pre_window_read is on), a failed read retries at most read_retries
+    # times (10, 20, 40 min apart) and is then skipped until the next check time, and never more
+    # than max_reads_per_day takeovers per day. Restarting the service does not cause a read.
+    "pre_window_read": False,
+    "read_retries": 3,
+    "max_reads_per_day": 5,
     "auto_book_on": True,
     "auto_unlock": True,  # only takes effect once the user saved a PIN (phone.py set-unlock-pin)
     "use_ai_for_schedule": True,
@@ -826,8 +833,9 @@ class _Service:
         self.state = load_json(STATE_FILE, {})
         self.state.setdefault("checks", {})
         self.state.setdefault("shifts", {})
-        self.startup_pending = True
-        self.last_read_try = 0.0
+        # Only a first-ever start reads at once. After a restart (watchdog, reboot, code update)
+        # the missed check times -- kept in state.json -- decide whether a read is due.
+        self.startup_pending = not self.state.get("last_read_ok")
         self.link_ok = True
         self.last_link_check = 0.0
         self.link_alerted_at = 0.0
@@ -859,50 +867,79 @@ class _Service:
         self.link_ok = ok
         return ok
 
-    def read_schedule(self, cfg: dict, now: dt.datetime, why: str) -> bool:
-        self.last_read_try = time.time()
+    def _takeovers_today(self, now: dt.datetime) -> int:
+        t = self.state.get("takeovers", {})
+        return t.get("n", 0) if t.get("day") == f"{now:%Y-%m-%d}" else 0
+
+    def read_schedule(self, cfg: dict, now: dt.datetime, why: str) -> str:
+        """'ok' | 'postponed' (nothing was touched: no link, phone in use, locked, in a call)
+        | 'failed' (we took over the screen but the read went wrong)."""
+        self.state["last_read_try"] = now.timestamp()
         if not self.link(cfg, force=True):
-            return False
+            return "postponed"
         if user_is_busy(cfg):
             log(f"schedule read ({why}) postponed: you're using the phone")
-            return False
+            return "postponed"
         try:
             access = ensure_awake_unlocked()
             if access != "ok":
                 log(f"schedule read ({why}) postponed: {'call in progress' if access == 'in_call' else 'phone locked'}")
-                return False
+                return "postponed"
+            self.state["takeovers"] = {"day": f"{now:%Y-%m-%d}", "n": self._takeovers_today(now) + 1}
+            self.save()
+            log(f"schedule read ({why}): reading InTouch "
+                f"(phone use {self.state['takeovers']['n']} of max {cfg['max_reads_per_day']} today)")
             refresh_schedule(cfg)
-            return True
-        except PhoneError as exc:
+            self.state["last_read_ok"] = now.isoformat(timespec="minutes")
+            return "ok"
+        except Exception as exc:  # any failure counts against the retry limit
             log(f"schedule read ({why}) failed: {exc}")
-            return False
+            return "failed"
         finally:
             relock_if_we_unlocked()
 
-    def tick(self) -> None:
+    def tick(self, now: dt.datetime | None = None) -> None:
         cfg = config()
-        now = dt.datetime.now()
+        now = now or dt.datetime.now()
         sched = load_json(SCHEDULE_FILE, [])
         self.link(cfg)
-        # 1. Schedule reads: at start-up and each check time (overdue slots collapse into one
-        #    read), plus a fresh read ~1 hour before every book-on window. Never during a window;
-        #    failed reads retry after 10 minutes.
+        # 1. Schedule reads: only at each check time (overdue slots collapse into one read), and on
+        #    the very first start. Never during a window. Failed reads back off and give up.
         due = [f"{now:%Y-%m-%d} {h}" for h in cfg["check_times"]
                if now.strftime("%H:%M") >= h and not self.state["checks"].get(f"{now:%Y-%m-%d} {h}")]
-        pre = [s for s in sched if s["start"] not in self.state.get("pre_read", [])
+        pre = [s for s in sched if cfg.get("pre_window_read") and s["start"] not in self.state.get("pre_read", [])
                and dt.timedelta(minutes=20) <= window(s, cfg)[0] - now <= dt.timedelta(minutes=75)]
-        if (self.startup_pending or due or pre) and time.time() - self.last_read_try >= 600 \
+        fails = self.state.get("read_fails", 0)
+        gap = 600 * 2 ** max(0, fails - 1)  # 10 min after a postponed/first failure, then 20, 40
+        if (self.startup_pending or due or pre) and now.timestamp() - self.state.get("last_read_try", 0) >= gap \
                 and not _in_any_window(cfg, now):
-            why = "start-up" if self.startup_pending else ("pre-window" if pre and not due else "daily")
-            if self.read_schedule(cfg, now, why):
+            if self._takeovers_today(now) >= cfg["max_reads_per_day"]:
+                if self.state.get("cap_logged") != f"{now:%Y-%m-%d}":
+                    log(f"schedule read skipped: already used the phone {cfg['max_reads_per_day']} times today")
+                    self.state["cap_logged"] = f"{now:%Y-%m-%d}"
+                result = "gave_up"
+            else:
+                why = "first start" if self.startup_pending else ("pre-window" if pre and not due else "daily")
+                result = self.read_schedule(cfg, now, why)
+            if result == "failed":
+                fails += 1
+                self.state["read_fails"] = fails
+                if fails >= cfg["read_retries"]:
+                    log(f"schedule read failed {fails} times -- leaving the phone alone until the next check time")
+                    notify("Couldn't read your InTouch shifts",
+                           f"Tried {fails} times; I'll try again at the next check time. Your saved shifts "
+                           "are still used for book-on.", nid="intouch-read")
+                    result = "gave_up"
+            if result in ("ok", "gave_up"):
                 self.startup_pending = False
+                self.state["read_fails"] = 0
                 for key in due:
-                    self.state["checks"][key] = now.isoformat(timespec="minutes")
+                    self.state["checks"][key] = now.isoformat(timespec="minutes") + ("" if result == "ok" else " skipped")
                 self.state["pre_read"] = (self.state.get("pre_read", []) + [s["start"] for s in pre])[-50:]
                 week_ago = f"{now - dt.timedelta(days=7):%Y-%m-%d}"
                 self.state["checks"] = {k: v for k, v in self.state["checks"].items() if k[:10] >= week_ago}
-                self.save()
                 sched = load_json(SCHEDULE_FILE, [])
+            self.save()
         # 2. Book-on windows -- every shift on its own, so two shifts in a day are both handled.
         for shift in sched:
             self.handle_shift(shift, cfg, now)

@@ -289,3 +289,97 @@ def test_phone_blocklist_refuses_logout():
     with pytest.raises(phone.PhoneError):
         phone.check_allowed("LOGOUT", force=False)
     phone.check_allowed("BOOK ON", force=False)
+
+
+# ---- schedule reads are rationed: they take over the phone ---------------------------------
+@pytest.fixture
+def reads(intouch, service, monkeypatch):
+    """Count real phone takeovers for schedule reads; each tick is one 30 s service loop."""
+    svc, sent = service
+    monkeypatch.setattr(intouch, "CONFIG_FILE", intouch.STATE_DIR / "config.json")
+    monkeypatch.setattr(intouch._Service, "link", lambda self, cfg, force=False: True)  # no real adb
+    monkeypatch.setattr(intouch, "log", lambda msg: None)
+    monkeypatch.setattr(intouch, "user_is_busy", lambda cfg: False)
+    monkeypatch.setattr(intouch, "ensure_awake_unlocked", lambda: "ok")
+    monkeypatch.setattr(intouch, "relock_if_we_unlocked", lambda: None)
+    calls = []
+    outcome = {"fail": False}
+
+    def refresh(cfg):
+        calls.append(1)
+        if outcome["fail"]:
+            raise intouch.PhoneError("InTouch did not open")
+        return []
+
+    monkeypatch.setattr(intouch, "refresh_schedule", refresh)
+
+    def run(svc, start, minutes):
+        t = start
+        for _ in range(minutes * 2):
+            svc.tick(t)
+            t += dt.timedelta(seconds=30)
+        return t
+
+    return svc, sent, calls, outcome, run
+
+
+def test_a_normal_day_reads_exactly_three_times(intouch, reads):
+    svc, _, calls, _, run = reads
+    svc.state["last_read_ok"] = "2026-11-19T19:00"  # not a first start
+    svc.startup_pending = False
+    run(svc, dt.datetime(2026, 11, 20, 0, 0), 24 * 60)
+    assert len(calls) == 3  # 07:00, 13:00, 19:00
+
+
+def test_restarting_the_service_does_not_read_again(intouch, reads):
+    svc, _, calls, _, run = reads
+    run(svc, dt.datetime(2026, 11, 20, 13, 30), 5)          # first ever start: one read
+    assert len(calls) == 1
+    for _ in range(6):                                        # watchdog restarts, code updates...
+        svc = intouch._Service()
+        run(svc, dt.datetime(2026, 11, 20, 14, 0), 5)
+    assert len(calls) == 1
+
+
+def test_overdue_check_times_collapse_into_one_read(intouch, reads):
+    svc, _, calls, _, run = reads
+    svc.state["last_read_ok"] = "2026-11-19T19:00"
+    svc.startup_pending = False
+    run(svc, dt.datetime(2026, 11, 20, 20, 0), 60)           # 07/13/19 all missed (phone off)
+    assert len(calls) == 1
+
+
+def test_failed_reads_give_up_after_three_tries(intouch, reads):
+    svc, sent, calls, outcome, run = reads
+    svc.state["last_read_ok"] = "2026-11-19T19:00"
+    svc.startup_pending = False
+    outcome["fail"] = True
+    run(svc, dt.datetime(2026, 11, 20, 7, 0), 5 * 60)        # 07:00 .. 12:00
+    assert len(calls) == 3                                    # 07:00, 07:10, 07:30 -- then stops
+    assert sent == ["Couldn't read your InTouch shifts"]
+    run(svc, dt.datetime(2026, 11, 20, 13, 0), 5)            # next check time tries again
+    assert len(calls) == 4
+
+
+def test_never_more_than_the_daily_cap(intouch, reads):
+    svc, _, calls, outcome, run = reads
+    svc.state["last_read_ok"] = "2026-11-19T19:00"
+    svc.startup_pending = False
+    outcome["fail"] = True
+    run(svc, dt.datetime(2026, 11, 20, 0, 0), 24 * 60)
+    assert len(calls) == 5                                    # 3 at 07:00, then the cap of 5
+
+
+def test_no_extra_read_before_a_window_by_default(intouch, reads):
+    svc, _, calls, _, run = reads
+    svc.state["last_read_ok"] = "2026-11-20T07:00"
+    svc.startup_pending = False
+    svc.state["checks"]["2026-11-20 07:00"] = "2026-11-20T07:00"
+    (intouch.STATE_DIR / "schedule.json").write_text('[{"start": "2026-11-20T11:00", "end": null}]')
+    monkeypatch_book = lambda cfg, shift=None: ("booked", "ok")
+    intouch.book_on_once, saved = monkeypatch_book, intouch.book_on_once
+    try:
+        run(svc, dt.datetime(2026, 11, 20, 9, 0), 2 * 60)    # 09:00 .. 11:00, window opens 10:45
+    finally:
+        intouch.book_on_once = saved
+    assert len(calls) == 0
