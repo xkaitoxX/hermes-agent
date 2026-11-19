@@ -1,6 +1,6 @@
 ---
 name: phone-control
-description: "See and operate this Android phone's apps (tap, type, read the screen) from Termux."
+description: "Operate this Android phone's apps from Termux via adb."
 version: 0.1.0
 author: xkaitoxX (custom Hermes fork)
 license: MIT

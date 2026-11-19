@@ -1,6 +1,6 @@
 ---
 name: intouch
-description: "Read Mitie InTouch shifts and auto book-on inside the shift's book-on window."
+description: "Read InTouch shifts; auto book-on in the shift window."
 version: 0.1.0
 author: xkaitoxX (custom Hermes fork)
 license: MIT
