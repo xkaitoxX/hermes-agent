@@ -8,6 +8,14 @@
 # 2. Clones or fast-forwards the fork into ~/hermes-custom (shallow).
 # 3. Installs the hermes-custom launcher into $PREFIX/bin.
 set -euo pipefail
+# This file lives inside the checkout it updates; bash reads scripts incrementally, so a
+# checkout that rewrites it mid-run would execute a mix of old and new lines. Run from a copy.
+if [ -z "${INSTALL_CUSTOM_COPY:-}" ]; then
+  copy="${TMPDIR:-/data/data/com.termux/files/usr/tmp}/install-custom.$$.sh"
+  cp "$0" "$copy"
+  INSTALL_CUSTOM_COPY=1 exec bash "$copy" "$@"
+fi
+trap 'rm -f "$0"' EXIT
 FORK_URL="${FORK_URL:-https://github.com/xkaitoxX/hermes-agent.git}"
 FORK_BRANCH="${FORK_BRANCH:-android}"
 SRC="${HERMES_CUSTOM_SRC:-$HOME/hermes-custom}"
