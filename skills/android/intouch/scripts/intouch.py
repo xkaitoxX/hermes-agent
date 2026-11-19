@@ -289,6 +289,7 @@ def open_intouch(cfg: dict) -> list[dict]:
                 raise PhoneError("InTouch returned to its login screen after logging in.")
             login(cfg, elems)
             logged_in = True
+            deadline = time.time() + 45  # login took a while; give the post-login prompts time
             continue
         if any(t.lower() in texts for t in (x.lower() for x in TAB_TITLES)):
             return elems
