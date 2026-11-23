@@ -601,15 +601,42 @@ def open_tab(cfg: dict, index: int) -> list[dict]:
     raise last or PhoneError(f"Could not open InTouch's {TAB_TITLES[index]} tab.")
 
 
-def read_shift_list(cfg: dict) -> tuple[list[str], list[dict]]:
+def _append_page(texts: list[str], page: list[str]) -> list[str]:
+    """Join a scrolled page onto what was read so far, dropping the overlap (the longest tail of
+    ``texts`` that the new page starts with), so a shift seen on both pages is not doubled while two
+    identical lines on different days are kept."""
+    for k in range(min(len(texts), len(page)), 0, -1):
+        if texts[-k:] == page[:k]:
+            return texts + page[k:]
+    return texts + page
+
+
+def read_shift_list(cfg: dict, pages: int = 1) -> tuple[list[str], list[dict]]:
+    """Text of the Shift List. ``pages`` > 1 scrolls down to read every shift InTouch lists (for
+    schedule reads), then scrolls back to the top; book-on reads only the first screen (the
+    shift being started is today's, at the top). Returns the first screen's elements."""
     elems = open_tab(cfg, 0)
     refresh = _labels_hit(elems, ["refresh"])
     if refresh:
         phone.tap_xy(*refresh["center"])
         time.sleep(4)
         elems = screen()
+    first = elems
     texts = [t for t in _texts(elems) if t not in TAB_TITLES]
-    return texts, elems
+    scrolled = 0
+    for _ in range(pages - 1):
+        phone.swipe("up")
+        time.sleep(1.5)
+        page = [t for t in _texts(screen()) if t not in TAB_TITLES]
+        scrolled += 1
+        before = len(texts)
+        texts = _append_page(texts, page)
+        if len(texts) == before:  # reached the end of the list
+            break
+    for _ in range(scrolled):
+        phone.swipe("down")
+        time.sleep(0.6)
+    return texts, first
 
 
 def read_calendar(cfg: dict, months: int = 2) -> list[str]:
@@ -808,7 +835,7 @@ def has_shift_content(texts: list[str]) -> bool:
 
 
 def refresh_schedule(cfg: dict) -> list[dict]:
-    shift_texts, _ = read_shift_list(cfg)
+    shift_texts, _ = read_shift_list(cfg, pages=cfg.get("read_pages", 6))
     texts = list(shift_texts)
     try:
         texts += read_calendar(cfg)
@@ -1494,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
                     "password_saved": SECRET_FILE.exists(), "login_paused_after_failure": LOGIN_BLOCK_FILE.exists()}
             print(json.dumps(info, indent=2))
         elif args.cmd == "shifts":
-            texts, _ = read_shift_list(cfg)
+            texts, _ = read_shift_list(cfg, pages=cfg.get("read_pages", 6))
             print("\n".join(texts))
             phone.shell("input keyevent 3")
         elif args.cmd == "calendar":

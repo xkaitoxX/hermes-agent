@@ -443,7 +443,7 @@ def test_audit_records_and_formats(intouch, service):
 
 def test_new_shift_is_audited_and_notified(intouch, service, monkeypatch):
     svc, sent = service
-    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg: (SAT_READ, []))
+    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg, pages=1: (SAT_READ, []))
     monkeypatch.setattr(intouch, "read_calendar", lambda cfg: [])
     monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
     monkeypatch.setattr(intouch.dt, "date", type("D", (dt.date,), {"today": classmethod(lambda c: dt.date(2026, 11, 21))}))
@@ -505,7 +505,7 @@ def card_phone(intouch, service, monkeypatch):
     monkeypatch.setattr(intouch.phone, "tap_xy", lambda x, y: sim["taps"].append((x, y)))
     monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
     monkeypatch.setattr(intouch, "screen", lambda: sim["screens"].pop(0) if len(sim["screens"]) > 1 else sim["screens"][0])
-    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg: (intouch._texts(sim["after"]), sim["after"]))
+    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg, pages=1: (intouch._texts(sim["after"]), sim["after"]))
     return sim
 
 
@@ -570,3 +570,30 @@ def test_request_holiday_and_end_shift_are_blocked(intouch):
 
 def test_duration_with_comma(intouch):
     assert intouch._duration("5 hr, 15 min").total_seconds() == 315 * 60
+
+
+# ---- reading the whole Shift List (scrolling) ---------------------------------------------------
+def test_scrolled_pages_join_without_doubling(intouch):
+    p1 = ["TODAY", "Scheduled", "Mon 10:45 - 19:30", "8 hr", "TUESDAY 24TH NOVEMBER", "Short Term Events"]
+    p2 = ["TUESDAY 24TH NOVEMBER", "Short Term Events", "Tue 14:00 - 20:00", "5 hr, 15 min",
+          "TUESDAY 1ST DECEMBER", "Tue 14:00 - 20:00"]
+    joined = intouch._append_page(p1, p2)
+    assert joined.count("Tue 14:00 - 20:00") == 2          # two Tuesdays a week apart are both kept
+    assert joined.count("TUESDAY 24TH NOVEMBER") == 1       # the overlap is not doubled
+    got = intouch.parse_shifts(joined, dt.date(2026, 11, 23))
+    assert [s["start"] for s in got] == ["2026-11-23T10:45", "2026-11-24T14:00", "2026-12-01T14:00"]
+
+
+def test_every_shift_gets_its_own_window(intouch, service, monkeypatch):
+    # Sunday: 07:00-19:00 main shift and a 19:30 short event -- each booked at its own time.
+    svc, sent = service
+    a = {"start": "2026-11-22T07:00", "end": "2026-11-22T19:00"}
+    b = {"start": "2026-11-22T19:30", "end": "2026-11-22T20:00"}
+    tried = []
+    monkeypatch.setattr(intouch, "book_on_once", lambda cfg, shift=None: (tried.append((shift["start"], t.strftime("%H:%M"))), ("booked", "On Site"))[1])
+    t = dt.datetime(2026, 11, 22, 6, 0)
+    while t <= dt.datetime(2026, 11, 22, 20, 0):
+        for s in (a, b):
+            svc.handle_shift(s, intouch.DEFAULTS, t)
+        t += dt.timedelta(seconds=30)
+    assert tried == [("2026-11-22T07:00", "06:45"), ("2026-11-22T19:30", "19:15")]
