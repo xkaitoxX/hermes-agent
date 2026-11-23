@@ -733,6 +733,8 @@ def parse_shifts(texts: list[str], today: dt.date | None = None) -> list[dict]:
     shifts, current = [], None
     for i, t in enumerate(texts):
         low = t.strip().lower()
+        if low in ("completed", "past shifts", "history"):
+            break  # InTouch lists finished shifts below this heading ("Attended (Reconciled)")
         if low in ("today", "tomorrow", "yesterday"):
             current = today + dt.timedelta(days={"today": 0, "tomorrow": 1, "yesterday": -1}[low])
             continue
@@ -836,11 +838,9 @@ def has_shift_content(texts: list[str]) -> bool:
 
 def refresh_schedule(cfg: dict) -> list[dict]:
     shift_texts, _ = read_shift_list(cfg, pages=cfg.get("read_pages", 6))
+    # Only the Shift List: its cards sit under day headings. The Calendar tab lists a shift as
+    # "Fri 07:00 - 19:00" with no date, which once put a phantom shift on the wrong day.
     texts = list(shift_texts)
-    try:
-        texts += read_calendar(cfg)
-    except PhoneError as exc:
-        log(f"calendar read failed: {exc}")
     found = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
     if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts):
         found = ai_extract(texts, cfg)

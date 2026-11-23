@@ -597,3 +597,12 @@ def test_every_shift_gets_its_own_window(intouch, service, monkeypatch):
             svc.handle_shift(s, intouch.DEFAULTS, t)
         t += dt.timedelta(seconds=30)
     assert tried == [("2026-11-22T07:00", "06:45"), ("2026-11-22T19:30", "19:15")]
+
+
+def test_completed_section_is_not_a_future_shift(intouch):
+    # Real full-list read, Mon 23 Nov: last Sunday's attended shift is listed under COMPLETED.
+    texts = ["TODAY", "Scheduled", "Mon 10:45 - 19:30", "8 hr", "TUESDAY 24TH NOVEMBER", "Short Term Events",
+             "Scheduled", "Tue 14:00 - 20:00", "5 hr, 15 min", "COMPLETED", "REM Shard Place - BAU",
+             "Attended (Reconciled)", "Sun 07:00", "12 hr"]
+    got = intouch.parse_shifts(texts, dt.date(2026, 11, 23))
+    assert [s["start"] for s in got] == ["2026-11-23T10:45", "2026-11-24T14:00"]
