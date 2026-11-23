@@ -639,6 +639,80 @@ def read_shift_list(cfg: dict, pages: int = 1) -> tuple[list[str], list[dict]]:
     return texts, first
 
 
+_DAY_CELL_RE = re.compile(r"^(Mon|Tues|Wednes|Thurs|Fri|Satur|Sun)day (\d{1,2}) ([A-Z][a-z]+) (\d{4})$")
+SHIFT_DOT_RGB = (91, 31, 105)  # InTouch's purple "scheduled shift" dot under a calendar day
+
+
+def _day_cells(elems: list[dict]) -> dict[dt.date, dict]:
+    """Visible calendar day cells by date (their description is the full date)."""
+    out = {}
+    for e in elems:
+        m = _DAY_CELL_RE.match(e["desc"].strip())
+        x1, y1, x2, y2 = e["bounds"]
+        if m and x2 - x1 > 50 and y2 - y1 > 50:
+            mon = _MONTHS.get(m.group(3).lower())
+            if mon:
+                out[dt.date(int(m.group(4)), mon, int(m.group(2)))] = e
+    return out
+
+
+def _has_shift_dot(img: tuple[int, int, bytes], cell: dict, rgb=SHIFT_DOT_RGB) -> bool:
+    x1, y1, x2, y2 = cell["bounds"]
+    h, cx = y2 - y1, (x1 + x2) // 2
+    return phone.count_colour(img, (cx - 15, y1 + int(h * 0.6), cx + 16, y1 + int(h * 0.85)), rgb) >= 60
+
+
+def _calendar_noise(t: str) -> bool:
+    return (t in TAB_TITLES or bool(_DAY_CELL_RE.match(t)) or t.lower() in (
+        "today", "request holiday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday",
+        "sunday", "go back to the previous month", "go forward to the next month")
+        or bool(re.match(r"^[A-Z][a-z]+ \d{4}$", t)))
+
+
+def read_calendar_shifts(cfg: dict, weeks: int | None = None) -> list[dict]:
+    """Shifts further ahead than the Shift List shows. On the Calendar, a purple dot under a day
+    means a scheduled shift; tapping the day shows its card ("Fri 07:00 - 19:00"), and the tapped
+    cell gives the exact date. The calendar then shows one week; the arrow moves a week on."""
+    weeks = weeks or cfg.get("calendar_weeks", 3)
+    today = dt.date.today()
+    open_tab(cfg, 1)
+    today_btn = next((e for e in screen() if e["desc"].strip().lower() == "today"), None)
+    if today_btn:
+        phone.tap_xy(*today_btn["center"])
+        time.sleep(2)
+    found: list[dict] = []
+    done: set[dt.date] = set()
+    last = today + dt.timedelta(weeks=weeks)
+    for _ in range(weeks + 2):
+        elems = screen()
+        visible = _day_cells(elems)
+        cells = {d: e for d, e in visible.items() if today <= d <= last and d not in done}
+        if not cells and visible and max(visible) > last:
+            break
+        img = phone.screencap_rgba()
+        for d in sorted(d for d, e in cells.items() if _has_shift_dot(img, e)):
+            cell = _day_cells(screen()).get(d)  # tapping a day can change the layout
+            if cell is None:
+                continue  # picked up when its week is shown
+            phone.tap_xy(*cell["center"])
+            time.sleep(2)
+            texts = [t for t in _texts(screen()) if not _calendar_noise(t)]
+            day_shifts = [s for s in parse_shifts([f"{d:%A %d %B %Y}"] + texts, today)
+                          if s["start"][:10] == d.isoformat()]
+            if not day_shifts:
+                log(f"calendar: {d} has a shift dot but no time was read: " + " | ".join(texts)[:150])
+            found += day_shifts
+            done.add(d)
+        if len(visible) <= 7:
+            done.update(cells)  # week view: these days are all checked
+        nxt = next((e for e in screen() if "next month" in e["desc"].lower()), None)
+        if not nxt:
+            break
+        phone.tap_xy(*nxt["center"])
+        time.sleep(2.5)
+    return found
+
+
 def read_calendar(cfg: dict, months: int = 2) -> list[str]:
     elems = open_tab(cfg, 1)
     out: list[str] = []
@@ -842,10 +916,19 @@ def refresh_schedule(cfg: dict) -> list[dict]:
     # "Fri 07:00 - 19:00" with no date, which once put a phantom shift on the wrong day.
     texts = list(shift_texts)
     found = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
+    calendar_ok = True
+    if cfg.get("read_calendar", True):
+        try:  # the Shift List only shows the next day or so; the Calendar shows weeks ahead
+            seen = {s["start"] for s in found}
+            found += [s for s in read_calendar_shifts(cfg) if s["start"] not in seen]
+        except PhoneError as exc:
+            calendar_ok = False  # keep the shifts we already know rather than "remove" them
+            log(f"calendar read failed: {exc}")
+            audit("read", "failed", f"calendar part: {exc}")
     if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts):
         found = ai_extract(texts, cfg)
     before = {s["start"]: s for s in load_json(SCHEDULE_FILE, []) if s.get("source") != "manual"}
-    sched = merge_schedule(found, replace_source=True)
+    sched = merge_schedule(found, replace_source=calendar_ok)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "last_read.txt").write_text("\n".join(texts))
     log(f"schedule refreshed: {len(found)} shift(s) read, {len(sched)} saved")

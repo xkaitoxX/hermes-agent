@@ -89,6 +89,38 @@ def shell(cmd: str, timeout: float = 30) -> str:
     return adb("shell", cmd, timeout=timeout)
 
 
+def screencap_rgba() -> tuple[int, int, bytes]:
+    """The screen as raw RGBA pixels: (width, height, data). For colour cues that are not in the
+    accessibility tree (e.g. coloured dots on a calendar)."""
+    cmd = [_adb_bin()] + (["-s", SERIAL] if SERIAL else []) + ["exec-out", "screencap"]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=40).stdout
+    except subprocess.TimeoutExpired as exc:
+        raise PhoneError("screencap timed out") from exc
+    if len(raw) < 16:
+        raise PhoneError("screencap returned nothing")
+    w, h = int.from_bytes(raw[0:4], "little"), int.from_bytes(raw[4:8], "little")
+    header = len(raw) - w * h * 4
+    if header not in (12, 16):
+        raise PhoneError(f"unexpected screencap format ({len(raw)} bytes for {w}x{h})")
+    return w, h, raw[header:]
+
+
+def count_colour(img: tuple[int, int, bytes], box: tuple[int, int, int, int], rgb: tuple[int, int, int],
+                 tol: int = 22) -> int:
+    """Pixels inside ``box`` (x1, y1, x2, y2) within ``tol`` of colour ``rgb``."""
+    w, h, data = img
+    x1, y1, x2, y2 = max(0, box[0]), max(0, box[1]), min(w, box[2]), min(h, box[3])
+    n = 0
+    for y in range(y1, y2):
+        row = y * w * 4
+        for x in range(x1, x2):
+            i = row + x * 4
+            if abs(data[i] - rgb[0]) <= tol and abs(data[i + 1] - rgb[1]) <= tol and abs(data[i + 2] - rgb[2]) <= tol:
+                n += 1
+    return n
+
+
 def connect() -> str:
     out = adb("connect", SERIAL, serial=False, check=False, timeout=15)
     devices = adb("devices", serial=False, check=False)

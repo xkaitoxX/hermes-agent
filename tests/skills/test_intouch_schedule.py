@@ -445,6 +445,7 @@ def test_new_shift_is_audited_and_notified(intouch, service, monkeypatch):
     svc, sent = service
     monkeypatch.setattr(intouch, "read_shift_list", lambda cfg, pages=1: (SAT_READ, []))
     monkeypatch.setattr(intouch, "read_calendar", lambda cfg: [])
+    monkeypatch.setattr(intouch, "read_calendar_shifts", lambda cfg: [])
     monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
     monkeypatch.setattr(intouch.dt, "date", type("D", (dt.date,), {"today": classmethod(lambda c: dt.date(2026, 11, 21))}))
     monkeypatch.setattr(intouch.dt, "datetime", type("T", (dt.datetime,), {"now": classmethod(lambda c: dt.datetime(2026, 11, 21, 19, 0))}))
@@ -606,3 +607,58 @@ def test_completed_section_is_not_a_future_shift(intouch):
              "Attended (Reconciled)", "Sun 07:00", "12 hr"]
     got = intouch.parse_shifts(texts, dt.date(2026, 11, 23))
     assert [s["start"] for s in got] == ["2026-11-23T10:45", "2026-11-24T14:00"]
+
+
+# ---- Calendar: purple dot = shift day; tap it for the times (seen live 23 Nov) ------------------
+def _week(dates, dots, selected=None):
+    """A week-view calendar: day cells plus a fake RGBA screen with purple dots under ``dots``."""
+    w, h = 1216, 1000
+    data = bytearray(w * h * 4)
+    cells = []
+    for i, d in enumerate(dates):
+        x1, x2, y1, y2 = i * 174, (i + 1) * 174, 731, 933
+        cells.append(_node("", (x1, y1, x2, y2), clickable=True, cls="ViewGroup", desc=f"{d:%A %d %B %Y}"))
+        if d in dots:
+            cx = (x1 + x2) // 2
+            for y in range(870, 890):
+                for x in range(cx - 8, cx + 9):
+                    data[(y * w + x) * 4:(y * w + x) * 4 + 3] = bytes(intouch_rgb := (91, 31, 105))
+    nav = [_node("", (147, 484, 260, 588), clickable=True, desc="Go forward to the next month"),
+           _node("", (1070, 491, 1184, 582), clickable=True, desc="Today")]
+    return cells + nav, (w, h, bytes(data))
+
+
+def test_calendar_reads_each_purple_day_with_its_date(intouch, service, monkeypatch):
+    mon = dt.date(2026, 11, 23)
+    wk1 = [mon + dt.timedelta(days=i) for i in range(7)]
+    wk2 = [mon + dt.timedelta(days=7 + i) for i in range(7)]
+    weeks = [_week(wk1, {wk1[4], wk1[6]}), _week(wk2, {wk2[5]})]
+    cards = {wk1[4]: ["Scheduled", "Fri 07:00 - 19:00", "12 hr"],
+             wk1[6]: ["Scheduled", "Sun 07:00 - 19:00", "12 hr", "Short Term Events", "Sun 19:30 - 20:00", "30 min"],
+             wk2[5]: ["Scheduled", "Sat 07:00 - 19:00", "12 hr"]}
+    state = {"week": 0, "day": None}
+
+    def screen():
+        elems, _ = weeks[min(state["week"], 1)]
+        extra = [_node(t, (128, 1000 + 80 * i, 1059, 1070 + 80 * i)) for i, t in enumerate(cards.get(state["day"], []))]
+        return elems + extra
+
+    def tap(x, y):
+        elems, _ = weeks[min(state["week"], 1)]
+        if 484 <= y <= 588 and x < 300:
+            state["week"] += 1
+            return
+        for e in elems:
+            if e["desc"].endswith("2026") and e["bounds"][0] <= x <= e["bounds"][2] and 731 <= y <= 933:
+                state["day"] = dt.datetime.strptime(e["desc"], "%A %d %B %Y").date()
+
+    monkeypatch.setattr(intouch, "open_tab", lambda cfg, i: screen())
+    monkeypatch.setattr(intouch, "screen", screen)
+    monkeypatch.setattr(intouch.phone, "tap_xy", tap)
+    monkeypatch.setattr(intouch.phone, "screencap_rgba", lambda: weeks[min(state["week"], 1)][1])
+    monkeypatch.setattr(intouch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(intouch.dt, "date", type("D", (dt.date,), {"today": classmethod(lambda c: mon)}))
+    got = intouch.read_calendar_shifts(intouch.DEFAULTS, weeks=2)
+    assert [(s["start"], s["end"]) for s in got] == [
+        ("2026-11-27T07:00", "2026-11-27T19:00"), ("2026-11-29T07:00", "2026-11-29T19:00"),
+        ("2026-11-29T19:30", "2026-11-29T20:00"), ("2026-12-05T07:00", "2026-12-05T19:00")]
