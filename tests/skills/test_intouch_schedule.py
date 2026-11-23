@@ -476,3 +476,97 @@ def test_pause_lifts_after_the_user_unlocks(intouch, service, monkeypatch):
     monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": True, "locked": False})
     intouch.resume_unlock_if_user_unlocked()
     assert not state["paused"]                   # the user unlocked it by hand
+
+
+# ---- starting a shift = tapping its card (InTouch, seen live 23 Nov) ---------------------------
+def _node(text, bounds, clickable=False, cls="TextView", desc="", pkg="com.mitie.InTouch"):
+    x1, y1, x2, y2 = bounds
+    return {"text": text, "desc": desc, "cls": cls, "pkg": pkg, "clickable": clickable, "password": False,
+            "bounds": list(bounds), "center": [(x1 + x2) // 2, (y1 + y2) // 2], "id": ""}
+
+
+def _list_screen(status="Scheduled"):
+    return [_node("Shift List", (481, 153, 788, 244)), _node("", (0, 289, 244, 445), desc="Selected "),
+            _node("TODAY", (49, 612, 1216, 685)), _node("", (0, 685, 1216, 1630), clickable=True, cls="ViewGroup"),
+            _node("View From The Shard 8 Hour Events", (128, 754, 1059, 946)), _node(status, (128, 1292, 1059, 1365)),
+            _node("Mon 10:45 - 19:30", (200, 1398, 706, 1474)), _node("8 hr", (866, 1398, 979, 1474))]
+
+
+CANT_YET = [_node("You can't start this shift yet", (161, 1169, 1055, 1255)),
+            _node("This shift can be started at 10:45 am on Monday", (83, 1281, 1133, 1429)),
+            _node("OK", (308, 1450, 516, 1606), clickable=True, cls="Button"),
+            _node("REQUEST HOLIDAY", (516, 1450, 1094, 1606), clickable=True, cls="Button")]
+
+
+@pytest.fixture
+def card_phone(intouch, service, monkeypatch):
+    sim = {"screens": [], "taps": []}
+    monkeypatch.setattr(intouch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(intouch.phone, "tap_xy", lambda x, y: sim["taps"].append((x, y)))
+    monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
+    monkeypatch.setattr(intouch, "screen", lambda: sim["screens"].pop(0) if len(sim["screens"]) > 1 else sim["screens"][0])
+    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg: (intouch._texts(sim["after"]), sim["after"]))
+    return sim
+
+
+def test_too_early_says_when_and_never_taps_request_holiday(intouch, card_phone):
+    sim = card_phone
+    sim["screens"] = [CANT_YET]
+    sim["after"] = _list_screen()
+    start = dt.datetime(2026, 11, 23, 10, 45)
+    out, detail = intouch._start_by_card(intouch.DEFAULTS, _list_screen(), _list_screen()[6], start, False)
+    assert out == "not_available" and "10:45 am" in detail
+    assert sim["taps"] == [(608, 1157), (412, 1528)]          # the card, then OK -- not REQUEST HOLIDAY
+    assert intouch.starts_at(detail, start) == dt.datetime(2026, 11, 23, 10, 45)
+
+
+def test_confirm_step_then_on_site_is_booked(intouch, card_phone):
+    sim = card_phone
+    confirm = [_node("Start this shift?", (100, 1100, 1100, 1200)),
+               _node("CANCEL", (100, 1450, 500, 1600), clickable=True, cls="Button"),
+               _node("START", (600, 1450, 1100, 1600), clickable=True, cls="Button")]
+    sim["screens"] = [confirm, _list_screen("On Site")]
+    sim["after"] = _list_screen("On Site")
+    out, detail = intouch._start_by_card(intouch.DEFAULTS, _list_screen(), _list_screen()[6],
+                                         dt.datetime(2026, 11, 23, 10, 45), False)
+    assert out == "booked" and "On Site" in detail
+    assert (850, 1525) in sim["taps"] and (300, 1525) not in sim["taps"]   # START, not CANCEL
+
+
+def test_already_on_site_taps_nothing(intouch, card_phone):
+    out, _ = intouch._start_by_card(intouch.DEFAULTS, _list_screen("On Site"), _list_screen("On Site")[6],
+                                    dt.datetime(2026, 11, 23, 10, 45), False)
+    assert out == "already" and card_phone["taps"] == []
+
+
+def test_waits_until_the_time_intouch_gives(intouch, service, monkeypatch):
+    svc, sent = service
+    shift = {"start": "2026-11-23T10:45", "end": "2026-11-23T19:30"}
+    calls = []
+    results = iter([("not_available", "You can't start this shift yet | This shift can be started at 10:45 am on Monday"),
+                    ("booked", "card now shows: On Site")])
+    monkeypatch.setattr(intouch, "book_on_once", lambda cfg, shift=None: (calls.append(1), next(results))[1])
+    t = dt.datetime(2026, 11, 23, 10, 30)
+    while t <= dt.datetime(2026, 11, 23, 10, 50):
+        svc.handle_shift(shift, intouch.DEFAULTS, t)
+        t += dt.timedelta(seconds=30)
+    assert len(calls) == 2                          # 10:30 (too early), then straight at 10:45
+    assert svc.state["shifts"][shift["start"]]["status"] == "booked"
+
+
+def test_android_pin_prompt_is_not_the_intouch_login(intouch):
+    prompt = [_node("Tap to cancel authentication", (0, 0, 1216, 300), pkg="com.android.systemui"),
+              _node("InTouch", (0, 400, 1216, 480), pkg="com.android.systemui"),
+              _node("", (0, 1505, 1216, 1583), cls="EditText", desc="PIN area", pkg="com.android.systemui")]
+    assert intouch._is_system_auth(prompt)
+    assert not intouch._is_system_auth(_list_screen())
+
+
+def test_request_holiday_and_end_shift_are_blocked(intouch):
+    for label in ("REQUEST HOLIDAY", "End shift", "Book off"):
+        with pytest.raises(intouch.PhoneError):
+            intouch.phone.check_allowed(label, force=False)
+
+
+def test_duration_with_comma(intouch):
+    assert intouch._duration("5 hr, 15 min").total_seconds() == 315 * 60

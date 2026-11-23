@@ -49,6 +49,9 @@ DEFAULT_BLOCKLIST = [
     r"\blog ?out\b", r"\bsign ?out\b", r"\bdelete\b", r"\buninstall\b", r"\bfactory reset\b",
     r"\berase\b", r"\bremove account\b", r"\bpay now\b", r"\bbuy\b", r"\bpurchase\b",
     r"\btransfer\b", r"\bsend money\b", r"\bconfirm payment\b",
+    # shift apps: booking on must never end a shift or file a request
+    r"\brequest holiday\b", r"\bend shift\b", r"\bfinish shift\b", r"\bbook ?off\b", r"\bclock ?out\b",
+    r"\bsign ?off\b",
 ]
 KEYS = {
     "back": 4, "home": 3, "enter": 66, "recents": 187, "wake": 224, "tab": 61,

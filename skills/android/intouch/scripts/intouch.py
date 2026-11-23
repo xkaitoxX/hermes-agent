@@ -487,6 +487,14 @@ def _clear_field(field: dict | None = None) -> None:
     phone.shell("input keyevent " + " ".join(["KEYCODE_DEL"] * 60))
 
 
+def _is_system_auth(elems: list[dict]) -> bool:
+    """Android's BiometricPrompt / device-credential screen (SystemUI), not an app screen."""
+    sysui = [e for e in elems if e.get("pkg", "").startswith("com.android.systemui")]
+    low = " ".join((e["text"] + " " + e["desc"]) for e in sysui).lower()
+    return bool(sysui) and ("cancel authentication" in low or "pin area" in low or "use pin" in low
+                            or "use password" in low or "fingerprint" in low)
+
+
 def _on_main_tabs(elems: list[dict]) -> bool:
     return any(e["desc"].strip().lower() == "selected" for e in elems) and \
         any(e["text"] in TAB_TITLES for e in elems)
@@ -523,7 +531,20 @@ def open_intouch(cfg: dict) -> list[dict]:
                 phone.tap_xy(*cancel["center"])
                 unknown_since = None
                 continue
-        if any("EditText" in e["cls"] and e["password"] for e in elems) or "forgotten password" in texts:
+        if _is_system_auth(elems):
+            # Android's own fingerprint/phone-PIN prompt that InTouch sometimes raises. Never type
+            # the phone PIN into it (wrong tries count towards a lockout): cancel it, which drops
+            # InTouch back to its normal password login.
+            cancel = _labels_hit(elems, ["cancel", "tap to cancel authentication", "use password"],
+                                 clickable_only=False)
+            if cancel and "cancel" in (cancel["text"] + cancel["desc"]).lower():
+                phone.tap_xy(*cancel["center"])
+            else:
+                phone.shell("input keyevent 4")
+            log("cancelled Android's security prompt over InTouch")
+            unknown_since = None
+            continue
+        if any("EditText" in e["cls"] and e["password"] and e["pkg"] == cfg["package"] for e in elems)                 or "forgotten password" in texts:
             if logins >= 2:
                 raise PhoneError("InTouch keeps returning to its login screen after logging in.")
             login(cfg, elems)
@@ -645,7 +666,7 @@ _HEADING_RE = re.compile(r"^\s*(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+)?(\
 _WD_PREFIX_RE = re.compile(r"^\s*(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s+\d", re.IGNORECASE)
 _PURE_TIME_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*(am|pm)?\s*$", re.IGNORECASE)
 # Length shown under a shift that has only its start time: "12 hr", "8.5 hrs", "1 hr 30 min", "30 min".
-_DURATION_RE = re.compile(r"^\s*(?:(\d{1,2}(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b)?\s*(?:(\d{1,3})\s*(?:m|min|mins|minutes)\b)?\s*$",
+_DURATION_RE = re.compile(r"^\s*(?:(\d{1,2}(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b)?,?\s*(?:(\d{1,3})\s*(?:m|min|mins|minutes)\b)?\s*$",
                           re.IGNORECASE)
 
 
@@ -851,13 +872,114 @@ def _time_strings(start: dt.datetime) -> list[str]:
 
 
 def _shift_anchor(elems: list[dict], start: dt.datetime) -> dict | None:
-    """The on-screen element showing this shift's start time (the card it belongs to)."""
+    """The on-screen element showing this shift's start time (the card it belongs to). When two
+    cards share the time (07:00 today and tomorrow), the one with the shift's weekday wins."""
     wanted = _time_strings(start)
+    hits = []
     for e in elems:
         label = (e["text"] or e["desc"] or "").lower()
         if any(re.search(r"(?<![\d:])" + re.escape(w.lower()) + r"(?![\d])", label) for w in wanted):
-            return e
-    return None
+            hits.append(e)
+    wd = f"{start:%a}".lower()
+    return next((e for e in hits if (e["text"] or e["desc"]).lower().startswith(wd)), hits[0] if hits else None)
+
+
+def _card_for(elems: list[dict], anchor: dict) -> dict | None:
+    """The smallest clickable element around the anchor: InTouch's shift card."""
+    ax, ay = anchor["center"]
+    boxes = [e for e in elems if e["clickable"] and e["bounds"][0] <= ax <= e["bounds"][2]
+             and e["bounds"][1] <= ay <= e["bounds"][3]]
+    return min(boxes, key=lambda e: (e["bounds"][2] - e["bounds"][0]) * (e["bounds"][3] - e["bounds"][1]),
+               default=None)
+
+
+def _inside(elems: list[dict], box: dict) -> list[str]:
+    x1, y1, x2, y2 = box["bounds"]
+    return [e["text"] or e["desc"] for e in elems if (e["text"] or e["desc"])
+            and x1 <= e["center"][0] <= x2 and y1 <= e["center"][1] <= y2]
+
+
+_CANT_START_RE = re.compile(r"can'?t start|cannot start|can not start|not able to start", re.IGNORECASE)
+_STARTS_AT_RE = re.compile(r"started at (\d{1,2}):(\d{2})\s*(am|pm)?", re.IGNORECASE)
+
+
+def starts_at(detail: str, shift_start: dt.datetime) -> dt.datetime | None:
+    """'This shift can be started at 10:45 am on Monday' -> that time on the shift's day."""
+    m = _STARTS_AT_RE.search(detail or "")
+    if not m:
+        return None
+    h, mi = _hm(m.group(1), m.group(2), m.group(3))
+    return dt.datetime.combine(shift_start.date(), dt.time(h, mi))
+
+
+START_LABELS = ["start shift", "start", "book on", "sign on", "clock in", "check in", "confirm", "yes",
+                "continue"]
+
+
+def _start_by_card(cfg: dict, elems: list[dict], anchor: dict, start: dt.datetime,
+                   dry_run: bool) -> tuple[str, str]:
+    """InTouch starts (books on to) a shift by tapping its card on the Shift List. Before the
+    allowed time it says "You can't start this shift yet -- can be started at 10:45 am"."""
+    card = _card_for(elems, anchor)
+    if card is None:
+        return "failed", "found the shift's time but not its card to tap"
+    on_card = _inside(elems, card)
+    low_card = " ".join(on_card).lower()
+    if any(re.search(r"\b" + re.escape(b) + r"\b", low_card) for b in cfg["booked_labels"]):
+        return "already", f"the {start:%H:%M} card shows: " + " | ".join(on_card)[:200]
+    if dry_run:
+        return "dry_run", f"would tap the {start:%H:%M} shift card at {card['center']}"
+    phone.tap_xy(*card["center"])
+    log(f"tapped the {start:%H:%M} shift card")
+    seen: list[str] = []
+    for _step in range(4):  # a message, a confirm step, maybe a second confirm
+        time.sleep(3)
+        elems = screen()
+        texts = _texts(elems)
+        seen += [t for t in texts if t not in seen and t not in TAB_TITLES]
+        low = " ".join(texts).lower()
+        if _on_main_tabs(elems):
+            if _step == 0:
+                continue  # InTouch may still be opening its message
+            break  # back on the list with no dialog
+        if _CANT_START_RE.search(low):
+            ok = _labels_hit(elems, ["ok", "close", "dismiss"])
+            if ok:
+                phone.tap_xy(*ok["center"])
+            return "not_available", " | ".join(t for t in texts if t not in TAB_TITLES)[:300]
+        buttons = [e for e in elems if e["clickable"] and (e["text"] or e["desc"])]
+        safe = []
+        for b in buttons:
+            try:
+                phone.check_allowed(b["text"] or b["desc"], force=False)
+                safe.append(b)
+            except PhoneError:
+                pass
+        go = _labels_hit(safe, START_LABELS)
+        if go:
+            label = go["text"] or go["desc"]
+            phone.tap_xy(*go["center"])
+            log(f"tapped \"{label}\"")
+            audit("book_on", "tapped", f"tapped \"{label}\" -- screen said: " + " | ".join(texts)[:200],
+                  shift=start.isoformat(timespec="minutes"))
+            continue
+        ok = _labels_hit(safe, ["ok", "close", "dismiss", "got it"])
+        if ok:  # an information message (e.g. not at the site): record it and close it
+            phone.tap_xy(*ok["center"])
+            time.sleep(2)
+            break
+        if not _on_main_tabs(elems):  # a details page or something unexpected
+            phone.shell("input keyevent 4")
+            time.sleep(2)
+            break
+    texts2, elems2 = read_shift_list(cfg)
+    anchor2 = _shift_anchor(elems2, start)
+    card2 = _card_for(elems2, anchor2) if anchor2 else None
+    status = " ".join(_inside(elems2, card2)).lower() if card2 else ""
+    if any(re.search(r"\b" + re.escape(b) + r"\b", status) for b in cfg["booked_labels"]):
+        return "booked", "card now shows: " + " | ".join(_inside(elems2, card2))[:150] + \
+            (" -- InTouch said: " + " | ".join(seen)[:150] if seen else "")
+    return "failed", ("InTouch said: " + " | ".join(seen) if seen else "no response to tapping the card")[:300]
 
 
 def _nearest(elems: list[dict], anchor: dict | None) -> dict | None:
@@ -896,6 +1018,8 @@ def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) ->
             merge_schedule(new, replace_source=False)
         start = dt.datetime.fromisoformat(shift["start"]) if shift else None
         anchor = _shift_anchor(elems, start) if start else None
+        if anchor is not None and cfg.get("start_by_tapping_card", True):
+            return _start_by_card(cfg, elems, anchor, start, dry_run)
         on_buttons = _all_hits(elems, cfg["book_on_labels"])
         booked_marks = _all_hits(elems, cfg["booked_labels"], clickable_only=False)
         if anchor is not None:
@@ -1176,6 +1300,8 @@ class _Service:
         gap = 20 if st.get("last_outcome") in ("locked", "in_call") else cfg["retry_every_min"] * 60
         if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
             return
+        if st.get("not_before") and now < dt.datetime.fromisoformat(st["not_before"]):
+            return  # InTouch said when the shift can be started; don't open it before then
         st["last_attempt"] = now.isoformat(timespec="seconds")
         st["attempts"] += 1
         if not self.link(cfg, force=True):
@@ -1183,6 +1309,10 @@ class _Service:
         else:
             outcome, detail = book_on_once(cfg, shift=shift)
         st["last_outcome"], st["last_detail"] = outcome, detail
+        allowed = starts_at(detail, dt.datetime.fromisoformat(shift["start"])) if outcome == "not_available" else None
+        if allowed and allowed > now:
+            st["not_before"] = allowed.isoformat(timespec="seconds")
+            log(f"InTouch allows starting the {label} shift at {allowed:%H:%M}; next try then")
         if outcome in ("locked", "in_call"):
             st["attempts"] -= 1  # a locked/in-call check is not a book-on attempt
             if st.get("last_logged") != outcome:
