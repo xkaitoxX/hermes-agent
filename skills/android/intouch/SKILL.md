@@ -26,6 +26,11 @@ the user. If the window closes without a book-on it notifies them to do it by ha
 
 - Several shifts a day are handled independently: each attempt anchors on that shift's start
   time on screen and taps the book-on control of that card only.
+- When the user asks what the service did, or why a book-on failed, run `$IT audit` (add
+  `--failures` for problems only) and summarise it; it never contains the password or PIN.
+- InTouch day headings have no year ("SUNDAY 22ND NOVEMBER"); a shift may show as a range
+  ("Sun 07:00 - 19:00") or as a start plus length ("Sun 07:00" + "12 hr"). "On Site" on a card
+  means booked on.
 - Shifts are read only at the check times (3x/day by default). A restart does not trigger a read;
   a failed read retries at most 3 times (10/20/40 min apart), and the phone is taken over at most
   `max_reads_per_day` (5) times a day for reads. `pre_window_read` adds a read ~1 h before a window.
@@ -47,6 +52,8 @@ $IT start | stop    # background service (reads 3x/day, books on in windows)
 $IT install-watchdog   # Android job: every 15 min + after reboot, restart the service if needed
 $IT reconnect       # try to restore the phone-control link (after a reboot)
 $IT log 40
+$IT audit [--days 7] [--failures]   # plain-English record of every action: reads, unlocks,
+                                     # logins, book-on attempts, alerts, new/removed shifts
 $IT config check_times '["07:00","13:00","19:00"]'
 ```
 
