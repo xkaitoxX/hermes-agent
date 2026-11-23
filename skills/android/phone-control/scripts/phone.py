@@ -303,8 +303,8 @@ def unlock() -> str:
     if in_call():
         raise PhoneError("A phone call is in progress; not touching the lock screen.")
     if UNLOCK_BLOCK_FILE.exists():
-        raise PhoneError("Automatic unlock is paused after a failed attempt. Unlock by hand once, then "
-                         "run: phone.py reset-unlock")
+        raise PhoneError("Automatic unlock is paused after a wrong PIN; it resumes after you next unlock "
+                         "the phone by hand (or run: phone.py reset-unlock)")
     secret = _read_pin()
     if not secret:
         raise PhoneError("Phone is locked and no unlock PIN/password/pattern is saved "
@@ -354,11 +354,33 @@ def unlock() -> str:
         time.sleep(0.6)
         if not screen_state()["locked"]:
             return "unlocked"
+    # Pause only when Android itself says the PIN was wrong. If the entry never registered (pocket
+    # mode / proximity sensor blocking touches, the bouncer closing), Android counted nothing, so
+    # stopping auto-unlock for days -- as happened -- protects nothing.
+    try:
+        shown = " ".join(n["text"] + " " + n["desc"] for n in dump_screen()).lower()
+    except PhoneError:
+        shown = ""
+    shell("input keyevent 4")
+    if any(w in shown for w in ("wrong", "incorrect", "try again in", "attempts")):
+        pause_unlock()
+        raise PhoneError("The phone said the saved PIN is wrong. Automatic unlock is paused (to avoid "
+                         "Android's lockout) until you next unlock the phone by hand.")
+    raise PhoneError("The phone did not unlock, but no wrong-PIN message was shown (touches blocked? "
+                     "phone in a pocket?). Will try again later.")
+
+
+def unlock_paused() -> bool:
+    return UNLOCK_BLOCK_FILE.exists()
+
+
+def pause_unlock() -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     UNLOCK_BLOCK_FILE.write_text(time.strftime("%Y-%m-%d %H:%M:%S"))
-    shell("input keyevent 4")
-    raise PhoneError("The phone did not unlock with the saved PIN. Automatic unlock is paused to avoid "
-                     "Android's lockout; unlock by hand, check the saved PIN, then run: phone.py reset-unlock")
+
+
+def resume_unlock() -> None:
+    UNLOCK_BLOCK_FILE.unlink(missing_ok=True)
 
 
 def lock() -> bool:

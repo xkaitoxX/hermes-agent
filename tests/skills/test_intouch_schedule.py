@@ -145,6 +145,8 @@ def service(intouch, tmp_path, monkeypatch):
     monkeypatch.setattr(intouch, "STATE_FILE", tmp_path / "state.json")
     monkeypatch.setattr(intouch, "SCHEDULE_FILE", tmp_path / "schedule.json")
     monkeypatch.setattr(intouch, "LOG_FILE", tmp_path / "log")
+    monkeypatch.setattr(intouch, "AUDIT_FILE", tmp_path / "audit.jsonl")
+    monkeypatch.setattr(intouch, "CONFIG_FILE", tmp_path / "config.json")
     monkeypatch.setenv("INTOUCH_VERBOSE", "0")
     sent = []
     monkeypatch.setattr(intouch, "notify", lambda title, text, nid="": sent.append(title))
@@ -383,3 +385,94 @@ def test_no_extra_read_before_a_window_by_default(intouch, reads):
     finally:
         intouch.book_on_once = saved
     assert len(calls) == 0
+
+
+# ---- real InTouch Shift List text (Nov 2026) --------------------------------------------------
+SAT_READ = ("SUNDAY 22ND NOVEMBER | REM Shard Place - BAU | REM Shard Place | Shard Quarter, 28-30 London Bridge | "
+            "SE1 9SG | Scheduled | Sun 07:00 - 19:00 | 12 hr | Short Term Events | 32 London Bridge | The Shard | "
+            "Scheduled | Sun 19:30 - 20:00 | 30 min").split(" | ")
+SUN_READ = ("TODAY|REM Shard Place - BAU|REM Shard Place|Shard Quarter, 28-30 London Bridge|SE1 9SG|On Site|"
+            "Sun 07:00|12 hr|Short Term Events|32 London Bridge|The Shard|Scheduled|Sun 19:30 - 20:00|30 min|"
+            "MONDAY 23RD NOVEMBER|November 2026|Today|Monday 23 November 2026|Tuesday 24 November 2026").split("|")
+
+
+def test_yearless_day_heading_gives_the_right_day(intouch):
+    # Read on Saturday: the 7-7 shift is on SUNDAY, not "today".
+    got = intouch.parse_shifts(SAT_READ, dt.date(2026, 11, 21))
+    assert [(s["start"], s["end"]) for s in got] == [("2026-11-22T07:00", "2026-11-22T19:00"),
+                                                    ("2026-11-22T19:30", "2026-11-22T20:00")]
+
+
+def test_start_time_plus_length_is_a_shift(intouch):
+    got = intouch.parse_shifts(SUN_READ, dt.date(2026, 11, 22))
+    assert [(s["start"], s["end"]) for s in got] == [("2026-11-22T07:00", "2026-11-22T19:00"),
+                                                    ("2026-11-22T19:30", "2026-11-22T20:00")]
+
+
+def test_weekday_without_heading_is_the_next_such_day(intouch):
+    got = intouch.parse_shifts(["Scheduled", "Wed 19:00 - 07:00", "12 hr"], dt.date(2026, 11, 23))  # a Monday
+    assert (got[0]["start"], got[0]["end"]) == ("2026-11-25T19:00", "2026-11-26T07:00")
+
+
+def test_a_lone_time_is_not_a_shift(intouch):
+    assert intouch.parse_shifts(["Last updated 10:32", "10:32"], dt.date(2026, 11, 23)) == []
+
+
+@pytest.mark.parametrize("text,minutes", [("12 hr", 720), ("30 min", 30), ("8.5 hrs", 510),
+                                          ("1 hr 30 min", 90), ("Scheduled", None)])
+def test_duration(intouch, text, minutes):
+    d = intouch._duration(text)
+    assert (d.total_seconds() // 60 if d else None) == minutes
+
+
+def test_on_site_card_counts_as_booked(intouch):
+    assert "on site" in intouch.DEFAULTS["booked_labels"]
+
+
+# ---- audit log -----------------------------------------------------------------------------------
+def test_audit_records_and_formats(intouch, service):
+    intouch.audit("book_on", "failed", "attempt 1: not on site", shift="2026-11-22T07:00")
+    intouch.audit("read", "ok", "2 upcoming shift(s)")
+    recs = intouch.read_audit(1)
+    assert [r["action"] for r in recs] == ["book_on", "read"]
+    text = intouch.format_audit(recs)
+    assert "✖ Book-on [11-22 07:00]: failed -- attempt 1: not on site" in text
+    assert "✔ Read shifts: ok" in text
+    assert "Read shifts" not in intouch.format_audit(recs, failures_only=True)
+
+
+def test_new_shift_is_audited_and_notified(intouch, service, monkeypatch):
+    svc, sent = service
+    monkeypatch.setattr(intouch, "read_shift_list", lambda cfg: (SAT_READ, []))
+    monkeypatch.setattr(intouch, "read_calendar", lambda cfg: [])
+    monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: "")
+    monkeypatch.setattr(intouch.dt, "date", type("D", (dt.date,), {"today": classmethod(lambda c: dt.date(2026, 11, 21))}))
+    monkeypatch.setattr(intouch.dt, "datetime", type("T", (dt.datetime,), {"now": classmethod(lambda c: dt.datetime(2026, 11, 21, 19, 0))}))
+    intouch.refresh_schedule(intouch.DEFAULTS)
+    assert sent == ["New shifts"]
+    added = [r for r in intouch.read_audit(9999) if r["action"] == "shift"]
+    assert [r["shift"] for r in added] == ["2026-11-22T07:00", "2026-11-22T19:30"]
+
+
+# ---- unlock pause ------------------------------------------------------------------------------
+def test_paused_unlock_does_not_wake_the_screen(intouch, service, monkeypatch):
+    shells = []
+    monkeypatch.setattr(intouch.phone, "in_call", lambda: False)
+    monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": False, "locked": True})
+    monkeypatch.setattr(intouch.phone, "pin_saved", lambda: True)
+    monkeypatch.setattr(intouch.phone, "unlock_paused", lambda: True)
+    monkeypatch.setattr(intouch.phone, "shell", lambda cmd, timeout=30: shells.append(cmd) or "")
+    assert intouch.ensure_awake_unlocked() == "locked"
+    assert shells == []
+
+
+def test_pause_lifts_after_the_user_unlocks(intouch, service, monkeypatch):
+    state = {"paused": True}
+    monkeypatch.setattr(intouch.phone, "unlock_paused", lambda: state["paused"])
+    monkeypatch.setattr(intouch.phone, "resume_unlock", lambda: state.update(paused=False))
+    monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": True, "locked": True})
+    intouch.resume_unlock_if_user_unlocked()
+    assert state["paused"]                       # still locked: nothing changes
+    monkeypatch.setattr(intouch.phone, "screen_state", lambda: {"awake": True, "locked": False})
+    intouch.resume_unlock_if_user_unlocked()
+    assert not state["paused"]                   # the user unlocked it by hand

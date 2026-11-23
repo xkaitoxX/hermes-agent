@@ -53,6 +53,7 @@ SCHEDULE_FILE = STATE_DIR / "schedule.json"
 STATE_FILE = STATE_DIR / "state.json"
 LOG_FILE = STATE_DIR / "intouch.log"
 PID_FILE = STATE_DIR / "daemon.pid"
+AUDIT_FILE = STATE_DIR / "audit.jsonl"           # what the service did, for the user (`intouch.py audit`)
 LOGIN_BLOCK_FILE = STATE_DIR / "login_blocked"  # present after a failed login: no more tries
 
 DEFAULTS = {
@@ -74,7 +75,7 @@ DEFAULTS = {
     "ai_command": "hermes-custom --provider deepseek -m deepseek-chat -z",
     "book_on_labels": ["book on", "sign on", "pin on", "clock in", "check in", "start shift", "book in"],
     "booked_labels": ["book off", "sign off", "pin off", "clock out", "check out", "end shift",
-                      "booked on", "you are on shift", "on shift"],
+                      "booked on", "you are on shift", "on shift", "on site"],
     "confirm_labels": ["confirm", "yes", "ok", "continue"],
 }
 NO_SHIFTS_TEXT = "you don't have any shifts"
@@ -109,8 +110,77 @@ def log(msg: str) -> None:
         print(line, flush=True)
 
 
+AUDIT_KEEP_DAYS = 60
+
+
+def audit(action: str, result: str, detail: str = "", shift: str | None = None) -> None:
+    """One line per real action in audit.jsonl -- what was done, when, and how it went. It never
+    contains the password or PIN (callers redact screen text from the login form)."""
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "action": action, "result": result,
+               "detail": (detail or "")[:300]}
+        if shift:
+            rec["shift"] = shift
+        with AUDIT_FILE.open("a") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def read_audit(days: float = 1.0) -> list[dict]:
+    cutoff = (dt.datetime.now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
+    out = []
+    try:
+        for line in AUDIT_FILE.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("ts", "") >= cutoff:
+                out.append(rec)
+    except OSError:
+        pass
+    return out
+
+
+def prune_audit() -> None:
+    """Keep the audit file to the last AUDIT_KEEP_DAYS days."""
+    keep = read_audit(AUDIT_KEEP_DAYS)
+    try:
+        if AUDIT_FILE.exists() and len(keep) < len(AUDIT_FILE.read_text().splitlines()):
+            tmp = AUDIT_FILE.with_suffix(".tmp")
+            tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep))
+            tmp.replace(AUDIT_FILE)
+    except OSError:
+        pass
+
+
+_AUDIT_WORDS = {"read": "Read shifts", "book_on": "Book-on", "unlock": "Unlock", "lock": "Lock",
+                "login": "Login", "notify": "Notified you", "service": "Service", "shift": "Shift list",
+                "window": "Window", "error": "Error"}
+
+
+def format_audit(recs: list[dict], failures_only: bool = False) -> str:
+    bad = ("failed", "error", "missed", "rejected", "gave_up", "skipped")
+    lines, day = [], None
+    for r in recs:
+        if failures_only and r["result"] not in bad:
+            continue
+        ts = dt.datetime.fromisoformat(r["ts"])
+        if ts.date() != day:
+            day = ts.date()
+            lines.append(f"\n{ts:%A %d %B}")
+        mark = "✖" if r["result"] in bad else ("✔" if r["result"] in ("ok", "booked", "already") else "·")
+        what = _AUDIT_WORDS.get(r["action"], r["action"])
+        shift = f" [{r['shift'][5:].replace('T', ' ')}]" if r.get("shift") else ""
+        lines.append(f"  {ts:%H:%M:%S} {mark} {what}{shift}: {r['result']}" + (f" -- {r['detail']}" if r["detail"] else ""))
+    return "\n".join(lines).strip() or "Nothing recorded in that period."
+
+
 def notify(title: str, text: str, nid: str = "intouch") -> None:
     log(f"NOTIFY {title}: {text}")
+    audit("notify", "sent", f"{title}: {text}")
     if shutil.which("termux-notification"):
         subprocess.run(["termux-notification", "--id", nid, "--title", title, "--content", text,
                         "--priority", "high", "--sound"], capture_output=True, timeout=20)
@@ -179,6 +249,9 @@ def ensure_awake_unlocked() -> str:
     if phone.in_call():
         return "in_call"  # never type/tap during a call (keys can become keypad tones)
     st = phone.screen_state()
+    can_unlock = config().get("auto_unlock") and phone.pin_saved() and not phone.unlock_paused()
+    if st["locked"] and not can_unlock:
+        return "locked"  # don't light the screen up for nothing
     if not st["awake"]:
         phone.shell("input keyevent 224")
         time.sleep(1.0)
@@ -189,20 +262,35 @@ def ensure_awake_unlocked() -> str:
     time.sleep(1.0)
     if not phone.screen_state()["locked"]:
         return "ok"
-    if config().get("auto_unlock") and phone.pin_saved():
-        try:
-            if phone.unlock() == "unlocked":
-                _UNLOCKED_BY_US = True
-                log("unlocked the phone for the job (will lock it again after)")
-            return "ok"
-        except PhoneError as exc:
-            log(f"automatic unlock failed: {exc}")
-            if "did not unlock" in str(exc):  # a fresh failure just now -- not the standing pause
-                notify("Automatic unlock stopped", "The saved PIN did not unlock the phone, so automatic "
-                       "unlock is paused (to avoid Android's lockout). Unlock by hand, check the PIN, then "
-                       "run: phone.py reset-unlock", nid="intouch-unlock-failed")
-            return "locked"
-    return "locked"
+    try:
+        if phone.unlock() == "unlocked":
+            _UNLOCKED_BY_US = True
+            log("unlocked the phone for the job (will lock it again after)")
+            audit("unlock", "ok", "unlocked the phone with your saved PIN")
+        return "ok"
+    except PhoneError as exc:
+        log(f"automatic unlock failed: {exc}")
+        audit("unlock", "failed", str(exc))
+        if phone.unlock_paused():  # a wrong-PIN message was shown just now
+            notify("Automatic unlock paused", "The phone said the saved PIN is wrong. I'll stop unlocking "
+                   "until you next unlock it by hand. If you changed your PIN, save the new one in Termux: "
+                   "phone.py set-unlock-pin", nid="intouch-unlock-failed")
+        return "locked"
+
+
+def resume_unlock_if_user_unlocked() -> None:
+    """Android clears its wrong-PIN count when the owner unlocks, so once the user has unlocked the
+    phone by hand, automatic unlock may safely try again (at most one wrong try between unlocks)."""
+    if not phone.unlock_paused() or _UNLOCKED_BY_US:
+        return
+    try:
+        st = phone.screen_state()
+    except PhoneError:
+        return
+    if st["awake"] and not st["locked"]:
+        phone.resume_unlock()
+        log("you unlocked the phone by hand -- automatic unlock is on again")
+        audit("unlock", "resumed", "automatic unlock switched back on after you unlocked the phone")
 
 
 def relock_if_we_unlocked() -> None:
@@ -214,10 +302,13 @@ def relock_if_we_unlocked() -> None:
             time.sleep(0.5)
             if phone.lock():
                 log("locked the phone again")
+                audit("lock", "ok", "locked the phone again")
             else:
                 log("screen off; the phone locks after its lock-screen delay")
+                audit("lock", "ok", "screen off; the phone locks after its lock-screen delay")
         except PhoneError as exc:
             log(f"could not lock the phone again: {exc}")
+            audit("lock", "failed", f"could not lock the phone again: {exc}")
 
 
 LOGIN_ERROR_WORDS = ("failed", "incorrect", "invalid", "locked", "not match", "wrong", "error",
@@ -255,6 +346,7 @@ def login(cfg: dict, elems: list[dict]) -> None:
     user = next((e for e in fields if e is not pwd), None)
     button = _labels_hit(elems, ["login", "log in", "sign in"])
     if not pwd or not button:
+        audit("login", "failed", "login form not recognised on screen: " + " | ".join(_texts(elems))[:150])
         raise PhoneError("InTouch login form not recognised.")
     if user is not None and not (user["text"] or "").strip():
         raise PhoneError("InTouch login form has no username filled in -- the user must log in by hand once.")
@@ -300,6 +392,8 @@ def login(cfg: dict, elems: list[dict]) -> None:
             _clear_field(field)
         time.sleep(1.0)
     if not typed_ok:
+        audit("login", "failed", f"password did not type correctly ({landed} of {len(secret)} characters); "
+              "nothing was sent")
         raise PhoneError(f"Password typing check failed ({landed} of {len(secret)} characters landed); "
                          "nothing was submitted. Will retry on the next attempt.")
     phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
@@ -318,6 +412,7 @@ def login(cfg: dict, elems: list[dict]) -> None:
         low = texts.lower()
         if any(t.lower() in low for t in TAB_TITLES):
             log("login ok")
+            audit("login", "ok", "logged in to InTouch with your saved password")
             return
         if "please enter your password" in low or "please enter your email" in low:
             ok = _labels_hit(elems, ["ok", "close", "dismiss"])
@@ -334,11 +429,13 @@ def login(cfg: dict, elems: list[dict]) -> None:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             LOGIN_BLOCK_FILE.write_text(dt.datetime.now().isoformat(timespec="seconds"))
             msg = _redact(texts, secret)[:200]
+            audit("login", "rejected", "InTouch said: " + msg)
             notify("InTouch login FAILED", "Auto-login stopped to avoid an account lock. Log in by hand, "
                    "fix the saved password, then run reset-login. App said: " + msg, nid="intouch-login")
             raise PhoneError("InTouch rejected the login: " + msg)
         if "fingerprint" in low or "biometric" in low:
             return  # an enrol/unlock prompt after login; open_intouch dismisses it
+    audit("login", "failed", "InTouch did not finish logging in within 30 s")
     raise PhoneError("InTouch did not finish logging in within 30s.")
 
 
@@ -541,27 +638,92 @@ def _date_from(m: re.Match) -> dt.date | None:
         return None
 
 
+_WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+# InTouch day headings have no year: "SUNDAY 22ND NOVEMBER", "Monday 23 November".
+_HEADING_RE = re.compile(r"^\s*(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s+)?(\d{1,2})(?:st|nd|rd|th)?\s+"
+                         r"([a-z]{3,9})\.?\s*$", re.IGNORECASE)
+_WD_PREFIX_RE = re.compile(r"^\s*(mon|tue|wed|thu|fri|sat|sun)[a-z]*\.?\s+\d", re.IGNORECASE)
+_PURE_TIME_RE = re.compile(r"^\s*\d{1,2}:\d{2}\s*(am|pm)?\s*$", re.IGNORECASE)
+# Length shown under a shift that has only its start time: "12 hr", "8.5 hrs", "1 hr 30 min", "30 min".
+_DURATION_RE = re.compile(r"^\s*(?:(\d{1,2}(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)\b)?\s*(?:(\d{1,3})\s*(?:m|min|mins|minutes)\b)?\s*$",
+                          re.IGNORECASE)
+
+
+def _heading_date(t: str, today: dt.date) -> dt.date | None:
+    """A yearless day heading -> the matching date closest to today."""
+    m = _HEADING_RE.match(t)
+    if not m:
+        return None
+    mon = _MONTHS.get(m.group(2).lower()) or _MONTHS.get(m.group(2).lower()[:3])
+    if not mon:
+        return None
+    options = []
+    for y in (today.year - 1, today.year, today.year + 1):
+        try:
+            options.append(dt.date(y, mon, int(m.group(1))))
+        except ValueError:
+            pass
+    return min(options, key=lambda d: abs(d - today)) if options else None
+
+
+def _duration(t: str) -> dt.timedelta | None:
+    m = _DURATION_RE.match(t or "")
+    if not m or not (m.group(1) or m.group(2)):
+        return None
+    return dt.timedelta(hours=float(m.group(1) or 0), minutes=int(m.group(2) or 0))
+
+
 def parse_shifts(texts: list[str], today: dt.date | None = None) -> list[dict]:
-    """Heuristic: a shift is a time (range) with the nearest preceding date in reading order.
-    A time with no date on the Shift List is taken as today."""
+    """Shifts from screen text in reading order.
+
+    The date comes from the nearest preceding heading ("TODAY", "SUNDAY 22ND NOVEMBER", a full
+    date) and is checked against a weekday prefix on the line ("Sun 07:00 - 19:00"); a weekday
+    with no matching heading means the next such day from today. The time is a range, or a start
+    time followed by a length line ("Sun 07:00" + "12 hr"). A lone start time without a weekday
+    is ignored (it is too often something else, like a 'last updated' time)."""
     today = today or dt.date.today()
     shifts, current = [], None
-    for t in texts:
+    for i, t in enumerate(texts):
+        low = t.strip().lower()
+        if low in ("today", "tomorrow", "yesterday"):
+            current = today + dt.timedelta(days={"today": 0, "tomorrow": 1, "yesterday": -1}[low])
+            continue
         dm = _DATE_RE.search(t)
-        if dm:
-            current = _date_from(dm) or current
+        if dm and _date_from(dm):
+            current = _date_from(dm)
+        elif _heading_date(t, today):
+            current = _heading_date(t, today)
         rm = _TIME_RANGE_RE.search(t)
+        wd = _WD_PREFIX_RE.match(t)
+        sm = _TIME_RE.search(t) if not rm and (wd or _PURE_TIME_RE.match(t)) else None
+        if not rm and not (sm and wd):
+            continue
+        day = current or today
+        if wd:
+            want = _WEEKDAYS.index(wd.group(1).lower())
+            if day.weekday() != want:  # heading missing or for another day: trust the weekday
+                day = today + dt.timedelta(days=(want - today.weekday()) % 7)
         if rm:
             sh, smin = _hm(rm.group(1), rm.group(2), rm.group(3) or rm.group(6))
             eh, emin = _hm(rm.group(4), rm.group(5), rm.group(6))
-            day = current or today
             start = dt.datetime.combine(day, dt.time(sh, smin))
             end = dt.datetime.combine(day, dt.time(eh, emin))
             if end <= start:
                 end += dt.timedelta(days=1)  # overnight shift
-            shifts.append({"start": start.isoformat(timespec="minutes"),
-                           "end": end.isoformat(timespec="minutes"), "raw": t[:200], "source": "parsed"})
-    return shifts
+        else:
+            sh, smin = _hm(sm.group(1), sm.group(2), sm.group(3))
+            start = dt.datetime.combine(day, dt.time(sh, smin))
+            length = _duration(texts[i + 1]) if i + 1 < len(texts) else None
+            end = start + length if length else None
+        shifts.append({"start": start.isoformat(timespec="minutes"),
+                       "end": end.isoformat(timespec="minutes") if end else None, "raw": t[:200],
+                       "source": "parsed"})
+    seen, out = set(), []
+    for s in shifts:  # the Shift List and the Calendar may both show a shift
+        if s["start"] not in seen:
+            seen.add(s["start"])
+            out.append(s)
+    return out
 
 
 def ai_extract(texts: list[str], cfg: dict) -> list[dict]:
@@ -634,12 +796,37 @@ def refresh_schedule(cfg: dict) -> list[dict]:
     found = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
     if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts):
         found = ai_extract(texts, cfg)
+    before = {s["start"]: s for s in load_json(SCHEDULE_FILE, []) if s.get("source") != "manual"}
     sched = merge_schedule(found, replace_source=True)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "last_read.txt").write_text("\n".join(texts))
     log(f"schedule refreshed: {len(found)} shift(s) read, {len(sched)} saved")
+    after = {s["start"]: s for s in sched if s.get("source") != "manual"}
+    now_iso = dt.datetime.now().isoformat(timespec="minutes")
+    added = [s for k, s in after.items() if k not in before and k > now_iso]
+    removed = [s for k, s in before.items() if k not in after and k > now_iso]
+    for s in added:
+        audit("shift", "added", f"new shift {_shift_label(s)}", shift=s["start"])
+    for s in removed:
+        audit("shift", "removed", f"shift no longer shown in InTouch: {_shift_label(s)}", shift=s["start"])
+    if added:
+        notify("New shift" + ("s" if len(added) > 1 else ""),
+               "In InTouch: " + "; ".join(_shift_label(s) for s in added) + ". I'll book you on.",
+               nid="intouch-new-shift")
+    if removed:
+        notify("Shift removed", "No longer in InTouch: " + "; ".join(_shift_label(s) for s in removed),
+               nid="intouch-removed-shift")
+    upcoming = [s for s in sched if s["start"] > now_iso]
+    audit("read", "ok", f"{len(upcoming)} upcoming shift(s)" +
+          (": " + "; ".join(_shift_label(s) for s in upcoming[:6]) if upcoming else ""))
     phone.shell("input keyevent 3")  # back to home screen
     return sched
+
+
+def _shift_label(s: dict) -> str:
+    start = dt.datetime.fromisoformat(s["start"])
+    end = f"–{dt.datetime.fromisoformat(s['end']):%H:%M}" if s.get("end") else ""
+    return f"{start:%a %d %b %H:%M}{end}"
 
 
 def next_shift(sched: list[dict], cfg: dict) -> dict | None:
@@ -875,16 +1062,24 @@ class _Service:
         """'ok' | 'postponed' (nothing was touched: no link, phone in use, locked, in a call)
         | 'failed' (we took over the screen but the read went wrong)."""
         self.state["last_read_try"] = now.timestamp()
+
+        def postponed(reason: str) -> str:
+            log(f"schedule read ({why}) postponed: {reason}")
+            if self.state.get("last_postponed") != reason:  # audit once per reason, not every 10 min
+                audit("read", "postponed", f"{why} read waiting: {reason}")
+                self.state["last_postponed"] = reason
+            return "postponed"
+
         if not self.link(cfg, force=True):
-            return "postponed"
+            return postponed("can't control the phone (wireless debugging off?)")
         if user_is_busy(cfg):
-            log(f"schedule read ({why}) postponed: you're using the phone")
-            return "postponed"
+            return postponed("you're using the phone")
         try:
             access = ensure_awake_unlocked()
             if access != "ok":
-                log(f"schedule read ({why}) postponed: {'call in progress' if access == 'in_call' else 'phone locked'}")
-                return "postponed"
+                return postponed("call in progress" if access == "in_call" else
+                                 "phone locked" + (" and auto-unlock is paused" if phone.unlock_paused() else ""))
+            self.state.pop("last_postponed", None)
             self.state["takeovers"] = {"day": f"{now:%Y-%m-%d}", "n": self._takeovers_today(now) + 1}
             self.save()
             log(f"schedule read ({why}): reading InTouch "
@@ -894,6 +1089,7 @@ class _Service:
             return "ok"
         except Exception as exc:  # any failure counts against the retry limit
             log(f"schedule read ({why}) failed: {exc}")
+            audit("read", "failed", str(exc))
             return "failed"
         finally:
             relock_if_we_unlocked()
@@ -902,7 +1098,8 @@ class _Service:
         cfg = config()
         now = now or dt.datetime.now()
         sched = load_json(SCHEDULE_FILE, [])
-        self.link(cfg)
+        if self.link(cfg):
+            resume_unlock_if_user_unlocked()
         # 1. Schedule reads: only at each check time (overdue slots collapse into one read), and on
         #    the very first start. Never during a window. Failed reads back off and give up.
         due = [f"{now:%Y-%m-%d} {h}" for h in cfg["check_times"]
@@ -916,6 +1113,7 @@ class _Service:
             if self._takeovers_today(now) >= cfg["max_reads_per_day"]:
                 if self.state.get("cap_logged") != f"{now:%Y-%m-%d}":
                     log(f"schedule read skipped: already used the phone {cfg['max_reads_per_day']} times today")
+                    audit("read", "skipped", f"daily limit reached ({cfg['max_reads_per_day']} phone uses for reads)")
                     self.state["cap_logged"] = f"{now:%Y-%m-%d}"
                 result = "gave_up"
             else:
@@ -926,6 +1124,7 @@ class _Service:
                 self.state["read_fails"] = fails
                 if fails >= cfg["read_retries"]:
                     log(f"schedule read failed {fails} times -- leaving the phone alone until the next check time")
+                    audit("read", "gave_up", f"failed {fails} times; next try at the next check time")
                     notify("Couldn't read your InTouch shifts",
                            f"Tried {fails} times; I'll try again at the next check time. Your saved shifts "
                            "are still used for book-on.", nid="intouch-read")
@@ -956,6 +1155,9 @@ class _Service:
             return
         if now > closes:
             st["status"] = "missed"
+            audit("book_on", "missed", f"window closed {closes:%H:%M} without a book-on; last result: "
+                  f"{st.get('last_outcome', 'no attempt was possible')} {st.get('last_detail', '')[:150]}",
+                  shift=shift["start"])
             notify("NOT booked on ✖",
                    f"The book-on window for your {label} shift{day} closed without a book-on. Book on by hand "
                    f"or tell your manager. Last result: {st.get('last_outcome', 'no attempt was possible')}.",
@@ -985,8 +1187,10 @@ class _Service:
             st["attempts"] -= 1  # a locked/in-call check is not a book-on attempt
             if st.get("last_logged") != outcome:
                 log(f"book-on for {shift['start']}: {detail} -- checking every 20 s")
+                audit("book_on", "waiting", f"{detail} -- checking every 20 s", shift=shift["start"])
         else:
             log(f"book-on attempt {st['attempts']} for {shift['start']}: {outcome} -- {detail}")
+            audit("book_on", outcome, f"attempt {st['attempts']}: {detail}", shift=shift["start"])
         st["last_logged"] = outcome
         if outcome in ("booked", "already"):
             st["status"] = outcome
@@ -1011,6 +1215,8 @@ def daemon(cfg: dict) -> None:
     PID_FILE.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     log("service started")
+    audit("service", "started", f"pid {os.getpid()}")
+    prune_audit()
     me = Path(__file__).resolve()
     sources = [me, me.parents[2] / "phone-control" / "scripts" / "phone.py"]
     stamp = [p.stat().st_mtime for p in sources if p.exists()]
@@ -1135,6 +1341,10 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("reset-login", help="allow auto-login again after a failed attempt")
     lg = sub.add_parser("log")
     lg.add_argument("n", nargs="?", type=int, default=30)
+    au = sub.add_parser("audit", help="what the service did: reads, unlocks, logins, book-ons, alerts")
+    au.add_argument("--days", type=float, default=1.0)
+    au.add_argument("--failures", action="store_true", help="only things that went wrong")
+    au.add_argument("--json", action="store_true")
     c = sub.add_parser("config")
     c.add_argument("key", nargs="?")
     c.add_argument("value", nargs="?")
@@ -1164,6 +1374,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(refresh_schedule(cfg), indent=2))
         elif args.cmd == "schedule":
             print(json.dumps(load_json(SCHEDULE_FILE, []), indent=2))
+        elif args.cmd == "audit":
+            recs = read_audit(args.days)
+            print(json.dumps(recs, indent=2, ensure_ascii=False) if args.json
+                  else format_audit(recs, failures_only=args.failures))
         elif args.cmd == "add-shift":
             start_t = dt.datetime.fromisoformat(f"{args.date}T{args.time}")
             end_t = dt.datetime.fromisoformat(f"{args.date}T{args.end}") if args.end else None

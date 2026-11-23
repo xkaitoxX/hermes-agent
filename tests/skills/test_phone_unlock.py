@@ -59,15 +59,30 @@ def test_pin_unlocks_once_and_is_verified(fake_phone):
     assert sum("input text" in c for c in fake_phone["shell"]) == 1
 
 
+WRONG_PIN = [{"desc": "", "text": "Wrong PIN", "cls": "TextView", "id": "", "pkg": "com.android.systemui",
+               "bounds": [0, 900, 1216, 960]}]
+
+
 def test_wrong_pin_pauses_further_unlocks(fake_phone):
     phone.PIN_FILE.write_text("0000")
+    fake_phone["screen"] = PIN_PAD + WRONG_PIN  # Android says the PIN was wrong
     with pytest.raises(phone.PhoneError, match="paused"):
         phone.unlock()
-    assert phone.UNLOCK_BLOCK_FILE.exists()
+    assert phone.unlock_paused()
     typed = sum("input text" in c for c in fake_phone["shell"])
     with pytest.raises(phone.PhoneError, match="paused"):
         phone.unlock()
     assert sum("input text" in c for c in fake_phone["shell"]) == typed  # no second PIN entry
+    phone.resume_unlock()  # the user unlocked by hand
+    assert not phone.unlock_paused()
+
+
+def test_unlock_that_did_not_register_does_not_pause(fake_phone):
+    # Touches blocked (pocket mode): no wrong-PIN message, so Android counted nothing.
+    phone.PIN_FILE.write_text("4826")
+    with pytest.raises(phone.PhoneError, match="no wrong-PIN message"):
+        phone.unlock()
+    assert not phone.unlock_paused()
 
 
 def test_no_saved_secret_says_how_to_set_it(fake_phone):
