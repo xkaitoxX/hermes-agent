@@ -62,7 +62,10 @@ $IT config check_times '["07:00","13:00","19:00"]'
 - "What are my shifts / when is my next shift?" -> `status`; if the schedule looks stale, `refresh`.
 - "Book me on now" -> `book-on`. Explain the result. `not_available` usually means InTouch has
   no book-on button yet (outside the window or not on site).
-- "Is auto book-on running?" -> `status`; offer `start` if stopped.
+- "Is auto book-on running?" -> `status`; offer `start` if stopped. `status` also shows where the
+  service runs (it must say `in: app`) and whether the watchdog job exists. `start` always launches
+  the service inside the Termux app, even from a USB/adb shell: anything left running in the USB
+  shell is killed when the cable is unplugged. The service renews its own watchdog every 6 hours.
 - A shift is missing -> `refresh`, then `add-shift` with the times the user gives.
 
 ## Login

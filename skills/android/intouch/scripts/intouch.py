@@ -1454,9 +1454,14 @@ def daemon(cfg: dict) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(str(os.getpid()))
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    log("service started")
-    audit("service", "started", f"pid {os.getpid()}")
+    ctx = run_context()
+    log(f"service started ({ctx})")
+    audit("service", "started", f"pid {os.getpid()}, running in: {ctx}")
+    if ctx == "adb":
+        audit("service", "failed", "running from a USB shell: it will stop when the cable is unplugged")
     prune_audit()
+    keep_watchdog()
+    watchdog_renewed = time.time()
     me = Path(__file__).resolve()
     sources = [me, me.parents[2] / "phone-control" / "scripts" / "phone.py"]
     stamp = [p.stat().st_mtime for p in sources if p.exists()]
@@ -1467,6 +1472,9 @@ def daemon(cfg: dict) -> None:
         except Exception as exc:  # never let one bad tick stop the service
             log(f"service error (continuing): {exc!r}\n" + traceback.format_exc(limit=4))
         time.sleep(30)
+        if time.time() - watchdog_renewed > 6 * 3600:
+            keep_watchdog()
+            watchdog_renewed = time.time()
         try:  # updated code (skills sync) -> re-exec in place: same pid, same app context
             if [p.stat().st_mtime for p in sources if p.exists()] != stamp:
                 log("code updated -- restarting the service onto it")
@@ -1526,17 +1534,113 @@ def install_watchdog() -> str:
     return (out.stdout + out.stderr).strip() or "watchdog scheduled"
 
 
+def watchdog_scheduled() -> bool | None:
+    """True/False if Termux:API can tell whether the watchdog job exists; None if it can't."""
+    if not shutil.which("termux-job-scheduler"):
+        return None
+    try:
+        out = subprocess.run(["termux-job-scheduler", "--pending"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return bool(re.search(rf"\b{WATCHDOG_JOB_ID}\b", out.stdout + out.stderr))
+
+
+def keep_watchdog() -> None:
+    """Re-schedule the watchdog job. Android or the phone's cleaner can drop it silently (it
+    vanished on 20 Nov 2026 and nothing restarted the service), so the service renews it."""
+    try:
+        result = install_watchdog()
+        log(f"watchdog renewed: {result}")
+    except (SystemExit, OSError, subprocess.SubprocessError) as exc:
+        log(f"watchdog could not be renewed: {exc}")
+        audit("service", "failed", f"watchdog could not be scheduled: {exc}")
+
+
 def ensure() -> None:
     if daemon_pid():
         return
     log("watchdog: service was not running -- starting it")
+    audit("service", "restarted", "the service had stopped; the watchdog started it again")
     start()
+
+
+# ---- where the service runs
+# Anything started over USB (adb shell / run-as) lives in adbd's process group, and Android kills
+# that whole group when adbd restarts -- which happens whenever the USB cable is unplugged. That
+# silently killed the service at 10:03 on 23 Nov 2026, before a 10:45 shift. So the service is
+# always launched inside the Termux app itself (its own TermuxService runs it, same app/uid, no
+# setting needed), where it lives as long as Termux does.
+TERMUX_PKG = "com.termux"
+
+
+def _cgroup(pid: int | str = "self") -> str:
+    try:
+        for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines():
+            if line.startswith("0::"):
+                return line[3:]
+    except OSError:
+        pass
+    return ""
+
+
+def _proc_name(pid: int | str) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[0].decode()
+    except OSError:
+        return ""
+
+
+def run_context(pid: int | str = "self") -> str:
+    """'app' (inside the Termux app), 'other-app' (e.g. a Termux:API job), 'adb' (USB shell:
+    dies when the cable is unplugged) or 'unknown'."""
+    cg = _cgroup(pid)
+    m = re.match(r"/apps/uid_\d+/pid_(\d+)", cg)
+    if m:
+        return "app" if _proc_name(m.group(1)) == TERMUX_PKG else "other-app"
+    if cg.startswith("/system/") or cg.startswith("/uid_0"):
+        return "adb"
+    return "unknown"
+
+
+def _start_in_termux_app() -> bool:
+    """Ask the Termux app to run `intouch.py start` as one of its own background tasks."""
+    if not shutil.which("am"):
+        return False
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    launcher = STATE_DIR / "launch.sh"
+    launcher.write_text("#!/data/data/com.termux/files/usr/bin/sh\n"
+                        f"INTOUCH_IN_APP=1 exec python {Path(__file__).resolve()} start "
+                        f">> {STATE_DIR / 'daemon.out'} 2>&1\n")
+    launcher.chmod(0o700)
+    try:
+        out = subprocess.run(["am", "startservice", "--user", "0", "-n", f"{TERMUX_PKG}/.app.TermuxService",
+                              "-a", "com.termux.service_execute", "-d", f"file://{launcher}",
+                              "--ez", "com.termux.execute.background", "true"],
+                             capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if out.returncode != 0 or "Error" in out.stdout + out.stderr:
+        return False
+    for _ in range(20):
+        time.sleep(0.5)
+        if daemon_pid():
+            return True
+    return False
 
 
 def start() -> None:
     if daemon_pid():
         print(f"already running (pid {daemon_pid()})")
         return
+    ctx = run_context()
+    if ctx != "app" and not os.environ.get("INTOUCH_IN_APP"):
+        if _start_in_termux_app():
+            print(f"started inside the Termux app (pid {daemon_pid()}); log: {LOG_FILE}")
+            return
+        log(f"could not hand the service to the Termux app; starting it here ({ctx})")
+        if ctx == "adb":
+            print("WARNING: started from a USB shell -- it will stop when the cable is unplugged. "
+                  "Run `intouch.py start` in the Termux app instead.")
     if shutil.which("termux-wake-lock"):
         subprocess.run(["termux-wake-lock"], timeout=20)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1597,7 +1701,10 @@ def main(argv: list[str] | None = None) -> int:
             sched = load_json(SCHEDULE_FILE, [])
             nxt = next_shift(sched, cfg)
             state = load_json(STATE_FILE, {"shifts": {}})
-            info = {"service": f"running (pid {daemon_pid()})" if daemon_pid() else "stopped",
+            pid = daemon_pid()
+            info = {"service": f"running (pid {pid}, in: {run_context(pid)})" if pid else "stopped",
+                    "watchdog": {True: "scheduled", False: "MISSING -- run install-watchdog",
+                                 None: "unknown"}[watchdog_scheduled()],
                     "next_shift": nxt, "window": [w.isoformat(timespec="minutes") for w in window(nxt, cfg)] if nxt else None,
                     "next_shift_state": state["shifts"].get(nxt["start"]) if nxt else None,
                     "saved_shifts": len(sched), "check_times": cfg["check_times"],

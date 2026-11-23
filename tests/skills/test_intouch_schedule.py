@@ -662,3 +662,78 @@ def test_calendar_reads_each_purple_day_with_its_date(intouch, service, monkeypa
     assert [(s["start"], s["end"]) for s in got] == [
         ("2026-11-27T07:00", "2026-11-27T19:00"), ("2026-11-29T07:00", "2026-11-29T19:00"),
         ("2026-11-29T19:30", "2026-11-29T20:00"), ("2026-12-05T07:00", "2026-12-05T19:00")]
+
+
+# ---- where the service runs: never inside the USB shell (it dies when the cable is unplugged)
+@pytest.mark.parametrize("cgroup,owner,ctx", [
+    ("/apps/uid_10726/pid_26432", "com.termux", "app"),
+    ("/apps/uid_10726/pid_21894", "com.termux.api", "other-app"),
+    ("/system/uid_0/pid_1607", "", "adb"),
+])
+def test_run_context(intouch, monkeypatch, cgroup, owner, ctx):
+    monkeypatch.setattr(intouch, "_cgroup", lambda pid="self": cgroup)
+    monkeypatch.setattr(intouch, "_proc_name", lambda pid: owner)
+    assert intouch.run_context() == ctx
+
+
+@pytest.fixture
+def launcher(intouch, service, monkeypatch):
+    sim = {"popen": 0, "handoff": 0, "handoff_ok": True}
+    monkeypatch.delenv("INTOUCH_IN_APP", raising=False)
+    monkeypatch.setattr(intouch, "daemon_pid", lambda: None)
+    monkeypatch.setattr(intouch.time, "sleep", lambda s: None)
+    monkeypatch.setattr(intouch.shutil, "which", lambda name: None)
+
+    def handoff():
+        sim["handoff"] += 1
+        return sim["handoff_ok"]
+
+    def popen(*a, **k):
+        sim["popen"] += 1
+        return type("P", (), {"pid": 4321})()
+
+    monkeypatch.setattr(intouch, "_start_in_termux_app", handoff)
+    monkeypatch.setattr(intouch.subprocess, "Popen", popen)
+    return sim
+
+
+def test_start_from_usb_shell_hands_the_service_to_the_termux_app(intouch, launcher, monkeypatch):
+    monkeypatch.setattr(intouch, "run_context", lambda pid="self": "adb")
+    intouch.start()
+    assert launcher["handoff"] == 1 and launcher["popen"] == 0
+
+
+def test_start_inside_termux_launches_directly(intouch, launcher, monkeypatch):
+    monkeypatch.setattr(intouch, "run_context", lambda pid="self": "app")
+    intouch.start()
+    assert launcher["handoff"] == 0 and launcher["popen"] == 1
+
+
+def test_start_falls_back_and_warns_if_handoff_fails(intouch, launcher, monkeypatch, capsys):
+    monkeypatch.setattr(intouch, "run_context", lambda pid="self": "adb")
+    launcher["handoff_ok"] = False
+    intouch.start()
+    assert launcher["popen"] == 1
+    assert "cable is unplugged" in capsys.readouterr().out
+
+
+def test_handed_off_start_does_not_hand_off_again(intouch, launcher, monkeypatch):
+    monkeypatch.setattr(intouch, "run_context", lambda pid="self": "unknown")
+    monkeypatch.setenv("INTOUCH_IN_APP", "1")
+    intouch.start()
+    assert launcher["handoff"] == 0 and launcher["popen"] == 1
+
+
+def test_watchdog_restart_is_audited(intouch, launcher, monkeypatch):
+    monkeypatch.setattr(intouch, "run_context", lambda pid="self": "other-app")
+    intouch.ensure()
+    assert launcher["handoff"] == 1
+    assert any(r["action"] == "service" and r["result"] == "restarted" for r in intouch.read_audit(1))
+
+
+def test_watchdog_that_cannot_be_scheduled_is_audited(intouch, service, monkeypatch):
+    def boom():
+        raise SystemExit("termux-job-scheduler missing")
+    monkeypatch.setattr(intouch, "install_watchdog", boom)
+    intouch.keep_watchdog()
+    assert any("watchdog" in r["detail"] for r in intouch.read_audit(1) if r["result"] == "failed")
