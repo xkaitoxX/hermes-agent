@@ -51,7 +51,8 @@ DEFAULT_BLOCKLIST = [
     r"\btransfer\b", r"\bsend money\b", r"\bconfirm payment\b",
     # shift apps: booking on must never end a shift or file a request
     r"\brequest holiday\b", r"\bend shift\b", r"\bfinish shift\b", r"\bbook ?off\b", r"\bclock ?out\b",
-    r"\bsign ?off\b",
+    r"\bsign ?off\b", r"\bpin ?(out|off)\b", r"\bbook ?out\b", r"\bcheck ?out\b", r"\bcancel shift\b",
+    r"\bsos\b", r"\bemergency\b", r"\bcheck call\b", r"^call\b",
 ]
 KEYS = {
     "back": 4, "home": 3, "enter": 66, "recents": 187, "wake": 224, "tab": 61,
@@ -76,13 +77,23 @@ def adb(*args: str, timeout: float = 30, check: bool = True, serial: bool = True
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
-        raise PhoneError(f"adb timed out: {' '.join(args)}") from exc
+        raise PhoneError(f"adb timed out: {_shown(args)}") from exc
     if check and proc.returncode != 0:
         msg = (proc.stderr or proc.stdout).strip()
+        if "input text" in " ".join(args) or "motionevent" in " ".join(args):
+            msg = ""  # the shell may echo the command line: never pass typed text on
         if "device" in msg and ("not found" in msg or "offline" in msg or "unauthorized" in msg):
             msg += "\nThe adb link to this phone is down. Run: phone.py connect  (see SKILL.md 'Setup')"
-        raise PhoneError(msg or f"adb {' '.join(args)} failed")
+        raise PhoneError(msg or f"adb {_shown(args)} failed")
     return proc.stdout
+
+
+def _shown(args: tuple[str, ...]) -> str:
+    """The adb arguments for an error message -- without anything that was being typed."""
+    joined = " ".join(args)
+    if "input text" in joined or "motionevent" in joined:  # a typed secret / a drawn unlock pattern
+        return "shell input <hidden>"
+    return joined[:200]
 
 
 def shell(cmd: str, timeout: float = 30) -> str:
@@ -192,6 +203,20 @@ def visible_elements(nodes: list[dict], show_all: bool = False) -> list[dict]:
     return out
 
 
+def mask_login_inputs(elems: list[dict]) -> list[dict]:
+    """On a screen that looks like a login (a password box, or the word "password" anywhere), hide
+    what the input boxes hold: some apps (InTouch) expose a typed password as plain text."""
+    words = " ".join((e["text"] + " " + e["desc"] + " " + e["id"]) for e in elems).lower()
+    if not (any(e["password"] for e in elems) or "password" in words or "passcode" in words):
+        return elems
+    out = []
+    for e in elems:
+        if ("EditText" in e["cls"] or e["password"]) and e["text"]:
+            e = {**e, "text": f"<{len(e['text'])} characters hidden: login screen>"}
+        out.append(e)
+    return out
+
+
 def describe(n: dict) -> str:
     label = n["text"] or n["desc"] or (n["id"].split("/")[-1] if n["id"] else "")
     label = re.sub(r"\s+", " ", label).strip()
@@ -263,6 +288,14 @@ def foreground() -> str:
     return f"{m.group(1)}/{m.group(2)}" if m else out.strip()
 
 
+def keyboard_shown() -> bool:
+    """True while the on-screen keyboard is up (BACK then only hides it)."""
+    try:
+        return "mInputShown=true" in shell("dumpsys input_method | grep -m 1 mInputShown")
+    except PhoneError:
+        return False
+
+
 def screen_state() -> dict:
     power = shell("dumpsys power | grep -E 'mWakefulness=|Display Power' | head -2")
     keyguard = shell("dumpsys window | grep -E 'isKeyguardShowing|mDreamingLockscreen|KeyguardShowing' | head -3")
@@ -320,6 +353,48 @@ def _draw_pattern(seq: str, bounds: list[int]) -> None:
     shell("; ".join(cmds))
 
 
+def _bouncer(nodes: list[dict]) -> tuple[str | None, list[int] | None]:
+    """Which secret the lock screen is asking for right now: ('pattern', bounds) | ('pin', None) |
+    ('password', None) | (None, None) when no entry pad is showing."""
+    sysui = [n for n in nodes if n["pkg"].startswith("com.android.systemui") or not n["pkg"]]
+    patt = next((n for n in sysui if "pattern" in (n["cls"] + n["id"] + n["desc"]).lower()
+                 and n["bounds"][2] - n["bounds"][0] > 200), None)
+    if patt is not None:
+        return "pattern", patt["bounds"]
+    descs = {n["desc"].lower() for n in sysui}
+    ids = " ".join(n["id"].lower() for n in sysui)
+    if "pin area" in descs or {"1", "2", "3"} <= {n["desc"] or n["text"] for n in sysui} \
+            or "pinentry" in ids or "keyguard_pin_view" in ids:
+        return "pin", None
+    if any("EditText" in n["cls"] for n in sysui):
+        return "password", None
+    return None, None
+
+
+def _lock_screen_clue(nodes: list[dict]) -> str:
+    """Why the PIN pad may not have come up -- for the log. Never screen text itself (a lock screen
+    shows private notifications): only the window in front, a count and a couple of known signs."""
+    try:
+        focus = shell("dumpsys window | grep -m 1 mCurrentFocus")
+    except PhoneError:
+        focus = ""
+    m = re.search(r"u0 ([^}\s]+)", focus)
+    words = " ".join((n["text"] + " " + n["desc"] + " " + n["id"]) for n in nodes).lower()
+    try:
+        st = screen_state()
+    except PhoneError:
+        st = {"awake": None}
+    clue = []
+    if st["awake"] is False:
+        clue.append("the screen would not stay on")
+    if re.search(r"pocket|mis-?touch|accidental|do not cover|don't cover", words):
+        clue.append("the phone's pocket / mistouch protection is showing -- it is probably covered")
+    if "try again in" in words or "too many" in words:
+        clue.append("the phone is asking to wait after wrong attempts")
+    clue.append(f"window in front: {m.group(1) if m else 'unknown'}; {len(nodes)} screen elements")
+    return "; ".join(clue)
+
+
 def unlock() -> str:
     """Unlock the phone with the PIN the user saved (``set-unlock-pin``). Returns 'already' | 'unlocked'.
 
@@ -350,29 +425,36 @@ def unlock() -> str:
     size = shell("wm size")
     m = re.search(r"(\d+)x(\d+)", size)
     w, h = (int(m.group(1)), int(m.group(2))) if m else (1080, 2400)
-    kind, pattern_bounds = None, None
-    for _ in range(3):  # bring up the bouncer (swipe up on the lock screen)
-        shell(f"input swipe {w // 2} {int(h * 0.82)} {w // 2} {int(h * 0.30)} 250")
-        time.sleep(1.3)
+    kind, pattern_bounds, nodes = None, None, []
+    # Raise the PIN pad. First just look (it may already be up); then ask Android for it without
+    # touching the screen (works when the phone's pocket / mistouch protection swallows swipes);
+    # only then swipe, two different ways.
+    steps = [None, "wm dismiss-keyguard", "input keyevent 82",
+             f"input swipe {w // 2} {int(h * 0.82)} {w // 2} {int(h * 0.30)} 250",
+             f"input swipe {w // 3} {int(h * 0.60)} {w // 3} {int(h * 0.15)} 450"]
+    for step in steps:
+        st = screen_state()
+        if not st["awake"]:
+            shell("input keyevent 224")
+            time.sleep(0.8)
+        if step:
+            if not lockscreen_in_front():  # an alarm or call screen: a swipe there could dismiss it
+                raise PhoneError("Another app is showing over the lock screen (alarm? call?); "
+                                 "nothing was entered.")
+            shell(step)
+            time.sleep(1.3)
         if not screen_state()["locked"]:
             return "unlocked"  # face unlock or a non-secure lock got there first
-        nodes = dump_screen()
-        descs = {n["desc"].lower() for n in nodes}
-        patt = next((n for n in nodes if "pattern" in (n["cls"] + n["id"] + n["desc"]).lower()
-                     and n["bounds"][2] - n["bounds"][0] > 200), None)
-        if patt is not None:
-            kind, pattern_bounds = "pattern", patt["bounds"]
+        try:
+            nodes = dump_screen()
+        except PhoneError:
+            nodes = []
+        kind, pattern_bounds = _bouncer(nodes)
+        if kind:
             break
-        if "pin area" in descs or {"1", "2", "3"} <= {n["desc"] for n in nodes}:
-            kind = "pin"
-            break
-        if any("EditText" in n["cls"] for n in nodes if n["pkg"].startswith("com.android.systemui")):
-            kind = "password"
-            break
-        shell("input keyevent 224")
-        time.sleep(0.8)
     if kind is None:
-        raise PhoneError("Could not bring up the lock screen's PIN/password/pattern entry.")
+        raise PhoneError("Could not bring up the lock screen's PIN/password/pattern entry "
+                         f"({_lock_screen_clue(nodes)}).")
     if (kind == "pattern") != (pattern is not None):
         raise PhoneError(f"The lock screen asks for a {kind}, but the saved secret is a "
                          f"{'pattern' if pattern else 'PIN/password'}. Nothing was entered.")
@@ -383,12 +465,21 @@ def unlock() -> str:
         _draw_pattern(pattern, pattern_bounds)
     else:
         shell("input text " + shlex.quote(secret))
-        time.sleep(0.4)
+        time.sleep(0.6)
+        if not screen_state()["locked"]:
+            return "unlocked"  # the phone accepted the PIN by itself: ENTER would land on the app behind
         shell("input keyevent 66")
-    for _ in range(8):
+    wrong_seen = False
+    for i in range(8):
         time.sleep(0.6)
         if not screen_state()["locked"]:
             return "unlocked"
+        if i == 1:  # a "Wrong PIN" message can be gone again within seconds: look early as well
+            try:
+                early = " ".join(n["text"] + " " + n["desc"] for n in dump_screen()).lower()
+                wrong_seen = any(x in early for x in ("wrong", "incorrect", "try again in", "attempts"))
+            except PhoneError:
+                pass
     # Pause only when Android itself says the PIN was wrong. If the entry never registered (pocket
     # mode / proximity sensor blocking touches, the bouncer closing), Android counted nothing, so
     # stopping auto-unlock for days -- as happened -- protects nothing.
@@ -397,7 +488,7 @@ def unlock() -> str:
     except PhoneError:
         shown = ""
     shell("input keyevent 4")
-    if any(w in shown for w in ("wrong", "incorrect", "try again in", "attempts")):
+    if wrong_seen or any(w in shown for w in ("wrong", "incorrect", "try again in", "attempts")):
         pause_unlock()
         raise PhoneError("The phone said the saved PIN is wrong. Automatic unlock is paused (to avoid "
                          "Android's lockout) until you next unlock the phone by hand.")
@@ -560,7 +651,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "current":
             print(foreground())
         elif args.cmd == "screen":
-            elems = visible_elements(dump_screen(), args.all)
+            elems = mask_login_inputs(visible_elements(dump_screen(), args.all))
             save_screen(elems)
             if args.json:
                 print(json.dumps(elems))

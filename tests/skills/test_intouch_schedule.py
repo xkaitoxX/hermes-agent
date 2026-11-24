@@ -521,19 +521,6 @@ def test_too_early_says_when_and_never_taps_request_holiday(intouch, card_phone)
     assert intouch.starts_at(detail, start) == dt.datetime(2026, 11, 23, 10, 45)
 
 
-def test_confirm_step_then_on_site_is_booked(intouch, card_phone):
-    sim = card_phone
-    confirm = [_node("Start this shift?", (100, 1100, 1100, 1200)),
-               _node("CANCEL", (100, 1450, 500, 1600), clickable=True, cls="Button"),
-               _node("START", (600, 1450, 1100, 1600), clickable=True, cls="Button")]
-    sim["screens"] = [confirm, _list_screen("On Site")]
-    sim["after"] = _list_screen("On Site")
-    out, detail = intouch._start_by_card(intouch.DEFAULTS, _list_screen(), _list_screen()[6],
-                                         dt.datetime(2026, 11, 23, 10, 45), False)
-    assert out == "booked" and "On Site" in detail
-    assert (850, 1525) in sim["taps"] and (300, 1525) not in sim["taps"]   # START, not CANCEL
-
-
 def test_already_on_site_taps_nothing(intouch, card_phone):
     out, _ = intouch._start_by_card(intouch.DEFAULTS, _list_screen("On Site"), _list_screen("On Site")[6],
                                     dt.datetime(2026, 11, 23, 10, 45), False)

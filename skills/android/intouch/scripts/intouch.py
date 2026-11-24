@@ -73,9 +73,15 @@ DEFAULTS = {
     "auto_unlock": True,  # only takes effect once the user saved a PIN (phone.py set-unlock-pin)
     "use_ai_for_schedule": True,
     "ai_command": "hermes-custom --provider deepseek -m deepseek-chat -z",
-    "book_on_labels": ["book on", "sign on", "pin on", "clock in", "check in", "start shift", "book in"],
-    "booked_labels": ["book off", "sign off", "pin off", "clock out", "check out", "end shift",
+    "book_on_labels": ["pin in", "book on", "sign on", "pin on", "clock in", "check in", "start shift",
+                       "book in"],
+    "booked_labels": ["book off", "sign off", "pin off", "pin out", "clock out", "check out", "end shift",
                       "booked on", "you are on shift", "on shift", "on site"],
+    # One book-on attempt: how long to stay with InTouch's pin-in pages, and how many times to let
+    # it look for GPS ("You can only book on when you are on site" -> TRY AGAIN) before giving the
+    # phone back until the next attempt.
+    "pin_in_seconds": 150,
+    "gps_tries": 3,
     "confirm_labels": ["confirm", "yes", "ok", "continue"],
 }
 NO_SHIFTS_TEXT = "you don't have any shifts"
@@ -101,9 +107,23 @@ def config() -> dict:
     return {**DEFAULTS, **load_json(CONFIG_FILE, {})}
 
 
+def _scrub(text: str) -> str:
+    """Take the saved InTouch password out of anything about to be written, shown or sent.
+    InTouch's password box is a plain text box to Android's screen reader, so screen text can
+    contain the password (it reached audit.jsonl on 24 Nov 2026). Every log, audit and
+    notification line passes through here, whatever the caller did."""
+    try:
+        secret = SECRET_FILE.read_text().strip()
+    except OSError:
+        return text
+    if len(secret) >= 3 and text:
+        text = re.sub(re.escape(secret), "[hidden]", text, flags=re.IGNORECASE)
+    return text
+
+
 def log(msg: str) -> None:
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {msg}"
+    line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S} {_scrub(msg)}"
     with LOG_FILE.open("a") as fh:
         fh.write(line + "\n")
     if os.environ.get("INTOUCH_VERBOSE", "1") == "1":
@@ -119,7 +139,7 @@ def audit(action: str, result: str, detail: str = "", shift: str | None = None) 
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         rec = {"ts": dt.datetime.now().isoformat(timespec="seconds"), "action": action, "result": result,
-               "detail": (detail or "")[:300]}
+               "detail": _scrub(detail or "")[:300]}
         if shift:
             rec["shift"] = shift
         with AUDIT_FILE.open("a") as fh:
@@ -138,6 +158,7 @@ def read_audit(days: float = 1.0) -> list[dict]:
             except ValueError:
                 continue
             if rec.get("ts", "") >= cutoff:
+                rec["detail"] = _scrub(rec.get("detail", ""))
                 out.append(rec)
     except OSError:
         pass
@@ -146,9 +167,10 @@ def read_audit(days: float = 1.0) -> list[dict]:
 
 def prune_audit() -> None:
     """Keep the audit file to the last AUDIT_KEEP_DAYS days."""
-    keep = read_audit(AUDIT_KEEP_DAYS)
+    keep = read_audit(AUDIT_KEEP_DAYS)  # scrubbed on the way in
     try:
-        if AUDIT_FILE.exists() and len(keep) < len(AUDIT_FILE.read_text().splitlines()):
+        fresh = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep)
+        if AUDIT_FILE.exists() and fresh != AUDIT_FILE.read_text():
             tmp = AUDIT_FILE.with_suffix(".tmp")
             tmp.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in keep))
             tmp.replace(AUDIT_FILE)
@@ -162,7 +184,7 @@ _AUDIT_WORDS = {"read": "Read shifts", "book_on": "Book-on", "unlock": "Unlock",
 
 
 def format_audit(recs: list[dict], failures_only: bool = False) -> str:
-    bad = ("failed", "error", "missed", "rejected", "gave_up", "skipped")
+    bad = ("failed", "error", "missed", "rejected", "gave_up", "skipped", "no_gps", "other_shift")
     lines, day = [], None
     for r in recs:
         if failures_only and r["result"] not in bad:
@@ -179,22 +201,37 @@ def format_audit(recs: list[dict], failures_only: bool = False) -> str:
 
 
 def notify(title: str, text: str, nid: str = "intouch") -> None:
+    title, text = _scrub(title), _scrub(text)
     log(f"NOTIFY {title}: {text}")
     audit("notify", "sent", f"{title}: {text}")
     if shutil.which("termux-notification"):
-        subprocess.run(["termux-notification", "--id", nid, "--title", title, "--content", text,
-                        "--priority", "high", "--sound"], capture_output=True, timeout=20)
+        try:  # a stuck Termux:API must never stop a book-on attempt
+            subprocess.run(["termux-notification", "--id", nid, "--title", title, "--content", text,
+                            "--priority", "high", "--sound"], capture_output=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            log(f"notification could not be shown: {exc!r}"[:200])
 
 
 # ---------------------------------------------------------------- app navigation
 def _texts(elems: list[dict]) -> list[str]:
+    """Every label on screen, in order -- except what is typed into input boxes. InTouch's password
+    box is plain text to the screen reader, so box contents must never reach a log, the audit, a
+    notification, the saved state or an AI prompt. (login() reads the box itself, for its length.)"""
     out = []
     for e in elems:
+        if "EditText" in e.get("cls", "") or e.get("password"):
+            continue
         for s in (e["text"], e["desc"]):
             s = re.sub(r"\s+", " ", s or "").strip()
             if s and s not in out and s.lower() not in ("selected", "selected "):
                 out.append(s)
     return out
+
+
+def _say(elems: list[dict], limit: int = 200) -> str:
+    """Screen text for a log/audit/notification line. Whatever is typed in an input box (email,
+    password -- even a half-typed one the scrubber could not match) is left out."""
+    return _scrub(" | ".join(_texts([e for e in elems if "EditText" not in e.get("cls", "")])))[:limit]
 
 
 def _area(e: dict) -> int:
@@ -266,16 +303,42 @@ def ensure_awake_unlocked() -> str:
         if phone.unlock() == "unlocked":
             _UNLOCKED_BY_US = True
             log("unlocked the phone for the job (will lock it again after)")
+            _note_unlock_ok()
             audit("unlock", "ok", "unlocked the phone with your saved PIN")
         return "ok"
     except PhoneError as exc:
         log(f"automatic unlock failed: {exc}")
-        audit("unlock", "failed", str(exc))
+        _note_unlock_failure(str(exc))
         if phone.unlock_paused():  # a wrong-PIN message was shown just now
             notify("Automatic unlock paused", "The phone said the saved PIN is wrong. I'll stop unlocking "
                    "until you next unlock it by hand. If you changed your PIN, save the new one in Termux: "
                    "phone.py set-unlock-pin", nid="intouch-unlock-failed")
         return "locked"
+
+
+def _note_unlock_failure(reason: str) -> None:
+    """Audit a failed unlock once per day and reason (the service retries every few minutes; nine
+    identical lines a day buried everything else). Every try is still in intouch.log."""
+    reason = (reason.splitlines() or [""])[0]
+    key = f"{dt.date.today()} " + re.sub(r"\d+ screen elements", "", reason)
+    path = STATE_DIR / "unlock_note.json"
+    note = load_json(path, {})
+    if note.get("key") != key:
+        audit("unlock", "failed", reason + " -- I keep trying; repeats today are not listed again")
+        note = {"key": key, "since": dt.datetime.now().isoformat(timespec="seconds"), "n": 0}
+    note["n"] = note.get("n", 0) + 1
+    save_json(path, note)
+
+
+def _note_unlock_ok() -> None:
+    path = STATE_DIR / "unlock_note.json"
+    note = load_json(path, {})
+    if note.get("n", 0) > 1:
+        audit("unlock", "info", f"{note['n']} failed tries since {note.get('since', '')[11:16]} before this one worked")
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def resume_unlock_if_user_unlocked() -> None:
@@ -327,6 +390,90 @@ def _redact(text: str, secret: str | None) -> str:
     return text.replace(secret, "[redacted]") if secret else text
 
 
+def _password_field(elems: list[dict]) -> dict | None:
+    """The login form's password box. While empty it shows the hint "Password"; with its eye
+    switched to "show", nothing marks it once it holds text -- then it is the lower of the two boxes."""
+    fields = [e for e in elems if "EditText" in e["cls"]]
+    pwd = next((e for e in fields if e["password"] or "password" in (e["text"] + e["desc"]).lower()), None)
+    if pwd is None and len(fields) >= 2:
+        pwd = max(fields, key=lambda e: e["center"][1])
+    return pwd
+
+
+def _box_now(box: dict) -> tuple[dict | None, list[dict]]:
+    """The password box as it is on screen right now (same place as ``box``), and the screen."""
+    elems = screen()
+    fields = [e for e in elems if "EditText" in e["cls"]]
+    return next((e for e in fields if e["center"] == box["center"]), None) or _password_field(elems), elems
+
+
+def _eye_button(elems: list[dict], box: dict) -> tuple[int, int]:
+    """Where the show/hide "eye" of the password box is: the control right of the box on its row."""
+    x1, y1, x2, y2 = box["bounds"]
+    row = [e for e in elems if e is not box and "EditText" not in e["cls"] and e["center"][0] > x2
+           and y1 - 20 <= e["center"][1] <= y2 + 20 and _area(e) < 4 * max(1, (y2 - y1)) ** 2]
+    if row:
+        best = min(row, key=lambda e: (not e["clickable"], _area(e) or 10**9))
+        return best["center"][0], best["center"][1]
+    m = re.search(r"(\d+)x\d+", phone.shell("wm size") or "")
+    width = int(m.group(1)) if m else max(e["bounds"][2] for e in elems)
+    return (x2 + width) // 2, (y1 + y2) // 2
+
+
+def _hide_password_box(box: dict) -> bool:
+    """Make sure the password box hides what is typed (its eye is OFF) BEFORE the password goes in,
+    so nobody next to the phone can read it. True only once that is certain.
+
+    A hidden box is marked as a password box by Android and shows dots. If it is not marked, one
+    throw-away character settles it: if that character can be read back, the box is in "show" mode
+    and the eye is tapped to switch it off."""
+    for _ in range(3):
+        now, elems = _box_now(box)
+        if now is None or not _cursor_in(now, elems):
+            return False
+        if now["password"]:
+            return True
+        if (now["text"] or "").strip().lower() not in ("", "password"):
+            _clear_field(now)  # leftovers: the test below needs an empty box
+            time.sleep(0.8)
+            continue
+        phone.shell("input text x")
+        time.sleep(0.8)
+        now, elems = _box_now(box)
+        probe = (now or {}).get("text", "")
+        phone.shell("input keyevent KEYCODE_DEL")  # wherever it went, take it out again
+        if now is None:
+            return False
+        if now["password"] or (len(probe) == 1 and not probe.isalnum()):
+            return True  # it came back as a dot
+        if probe != "x":
+            time.sleep(1.0)  # the character did not land in the box: nothing is proven, look again
+            continue
+        phone.tap_xy(*_eye_button(elems, now))
+        log("the password box was showing its text: switched it to hidden (tapped the eye)")
+        audit("login", "info", "the password box was in 'show' mode; switched it to hidden before typing")
+        time.sleep(0.8)
+        phone.tap_xy(*now["center"])  # focus back in the box
+        time.sleep(0.8)
+        _dismiss_autofill_sheet()
+    return False
+
+
+def _cursor_in(box: dict, elems: list[dict]) -> bool:
+    """False when the cursor is known to be in ANOTHER input box (the email box): typing then would
+    put the password there, in clear."""
+    return not any("EditText" in e["cls"] and e.get("focused") and e["center"] != box["center"] for e in elems)
+
+
+def _type_secret_command(text: str) -> str:
+    """Type the password in one go, so the characters do not appear one by one (Android previews
+    each typed character for a moment). `input text` writes a space as %s; only a password that
+    itself contains a % needs the slow, one-character-at-a-time way."""
+    if "%" in text:
+        return _type_command(text)
+    return "input text " + _shell_quote(text.replace(" ", "%s"))
+
+
 def login(cfg: dict, elems: list[dict]) -> None:
     """Fill InTouch's login form with the password the user saved via `set-password`.
 
@@ -342,11 +489,11 @@ def login(cfg: dict, elems: list[dict]) -> None:
         raise PhoneError("InTouch needs a login and no password is saved. Either log in by hand, or "
                          "save it once in Termux: intouch.py set-password")
     fields = [e for e in elems if "EditText" in e["cls"]]
-    pwd = next((e for e in fields if e["password"] or "password" in (e["text"] + e["desc"]).lower()), None)
+    pwd = _password_field(elems)
     user = next((e for e in fields if e is not pwd), None)
     button = _labels_hit(elems, ["login", "log in", "sign in"])
     if not pwd or not button:
-        audit("login", "failed", "login form not recognised on screen: " + " | ".join(_texts(elems))[:150])
+        audit("login", "failed", "login form not recognised on screen: " + _say(elems, 150))
         raise PhoneError("InTouch login form not recognised.")
     if user is not None and not (user["text"] or "").strip():
         raise PhoneError("InTouch login form has no username filled in -- the user must log in by hand once.")
@@ -358,6 +505,7 @@ def login(cfg: dict, elems: list[dict]) -> None:
     # InTouch sometimes throws a fingerprint prompt over the form mid-way, stealing focus, so
     # typing is retried up to 3 times; LOGIN is pressed only after a verified fill.
     typed_ok = False
+    hidden_ok = True
     landed = 0
     for _attempt in range(3):
         elems = screen()
@@ -369,48 +517,74 @@ def login(cfg: dict, elems: list[dict]) -> None:
             time.sleep(1.5)
             continue
         fields = [e for e in elems if "EditText" in e["cls"]]
-        pwd_now = next((e for e in fields if e["password"] or "password" in (e["text"] + e["desc"]).lower()),
-                       None) or next((e for e in fields if e["center"] == pwd["center"]), None)
+        pwd_now = next((e for e in fields if e["center"] == pwd["center"]), None) or _password_field(elems)
         if pwd_now is None:
             time.sleep(1.5)
             continue
         phone.tap_xy(*pwd_now["center"])
         time.sleep(1.5)
         _dismiss_autofill_sheet()
+        box, on_screen = _box_now(pwd_now)
+        if box is None or not _cursor_in(box, on_screen):
+            time.sleep(1.0)
+            continue  # the cursor is not in the password box: tap it again
         _clear_field()
-        phone.shell(_type_command(secret))
+        if not _hide_password_box(pwd_now):
+            hidden_ok = False
+            continue  # never type the password into a box that shows it
+        hidden_ok = True
+        box, on_screen = _box_now(pwd_now)
+        if box is None or not _cursor_in(box, on_screen):
+            continue
+        phone.shell(_type_secret_command(secret))
         time.sleep(1.0)
         elems = screen()
         fields = [e for e in elems if "EditText" in e["cls"]]
         field = next((e for e in fields if e["center"] == pwd_now["center"]), None) or (fields[-1] if fields else None)
         typed = (field or {}).get("text", "")
         landed = 0 if typed.strip().lower() == "password" else len(typed)
+        if field is not None and typed == secret:
+            # It can be read back, so it is showing after all: wipe it at once and start over hidden.
+            _clear_field(field)
+            log("the password box showed its text after typing; cleared it")
+            audit("login", "failed", "the password box showed the password for a moment after typing "
+                  "(cleared at once, not sent) -- consider changing the password")
+            hidden_ok = False
+            continue
         if landed == len(secret):
             typed_ok = True
             break
         if field is not None:
             _clear_field(field)
         time.sleep(1.0)
+    if not typed_ok and not hidden_ok:
+        audit("login", "failed", "could not switch the password box to hidden (its eye stayed on), so the "
+              "password was not typed; nothing was sent")
+        raise PhoneError("InTouch's password box would not hide its text, so the password was not typed. "
+                         "Tap the eye next to the password box once so it is crossed out.")
     if not typed_ok:
-        audit("login", "failed", f"password did not type correctly ({landed} of {len(secret)} characters); "
-              "nothing was sent")
-        raise PhoneError(f"Password typing check failed ({landed} of {len(secret)} characters landed); "
-                         "nothing was submitted. Will retry on the next attempt.")
-    phone.shell("input keyevent 4")  # hide the keyboard so the button is not covered
-    time.sleep(1.0)
+        audit("login", "failed", "the password did not type correctly; nothing was sent")
+        raise PhoneError("Password typing check failed; nothing was submitted. Will retry on the next attempt.")
+    if phone.keyboard_shown():  # hide the keyboard so the button is not covered. Only then: with
+        phone.shell("input keyevent 4")  # no keyboard up, BACK closes InTouch and loses the login
+        time.sleep(1.0)
     elems = screen()
     if not any("EditText" in e["cls"] for e in elems):  # BACK left the form -- don't press blindly
         raise PhoneError("Login form disappeared before submitting; nothing was submitted.")
     button = _labels_hit(elems, ["login", "log in", "sign in"]) or button
     phone.tap_xy(*button["center"])
     log("login submitted")
-    deadline = time.time() + 30
+    submitted = time.time()
+    deadline = submitted + 30
     while time.time() < deadline:
         time.sleep(2)
         elems = screen()
         texts = " ".join(_texts(elems))
         low = texts.lower()
-        if any(t.lower() in low for t in TAB_TITLES):
+        if "logging you in" in low and time.time() - submitted < 75:
+            deadline = max(deadline, time.time() + 10)  # still working (slow network)
+            continue
+        if _on_main_tabs(elems) or any(t.lower() in low for t in TAB_TITLES):
             log("login ok")
             audit("login", "ok", "logged in to InTouch with your saved password")
             return
@@ -435,8 +609,9 @@ def login(cfg: dict, elems: list[dict]) -> None:
             raise PhoneError("InTouch rejected the login: " + msg)
         if "fingerprint" in low or "biometric" in low:
             return  # an enrol/unlock prompt after login; open_intouch dismisses it
-    audit("login", "failed", "InTouch did not finish logging in within 30 s")
-    raise PhoneError("InTouch did not finish logging in within 30s.")
+    audit("login", "failed", f"InTouch did not finish logging in within {int(time.time() - submitted)} s; "
+          "screen: " + _say(elems, 150))
+    raise PhoneError("InTouch did not finish logging in in time.")
 
 
 def _shell_quote(s: str) -> str:
@@ -495,7 +670,109 @@ def _is_system_auth(elems: list[dict]) -> bool:
                             or "use password" in low or "fingerprint" in low)
 
 
+def _lows(elems: list[dict]) -> set[str]:
+    return {t.lower() for t in _texts(elems)}
+
+
+def _on_site_screen(elems: list[dict]) -> bool:
+    """InTouch's first tab while a shift is running: title "On Site", TIME ON SITE, CHECK CALL, a
+    Call-your-manager button and an SOS button. Booking on ends here. Nothing on it is ever tapped."""
+    low = _lows(elems)
+    return "on site" in low and ("time on site" in low or "check call" in low)
+
+
+def _shift_details_screen(elems: list[dict]) -> bool:
+    return "shift details" in _lows(elems)
+
+
+_CANT_START_RE = re.compile(r"can['\u2019]?t start|cannot start|can not start|not able to start", re.IGNORECASE)
+_LOCATION_RE = re.compile(r"only book on when you are on site|verify your location", re.IGNORECASE)
+_CONFIRM_PIN_RE = re.compile(r"about to pin in|pin in to confirm|confirm attendance", re.IGNORECASE)
+_BUSY_RE = re.compile(r"acquiring gps|logging you in|please wait|loading", re.IGNORECASE)
+# Whatever a button's own label says, nothing is confirmed on a screen that mentions any of these.
+_NEVER_RE = re.compile(r"\bpin ?(out|off)\b|\bbook ?(off|out)\b|\b(end|finish|cancel) shift\b|\blog ?out\b"
+                       r"|\bsign ?(out|off)\b|\bclock ?out\b|\bholiday\b|\bsos\b|\bcheck call\b",
+                       re.IGNORECASE)
+
+
+def _busy(texts: list[str]) -> bool:
+    """InTouch is working ("Acquiring GPS", "Logging you in"): wait, press nothing."""
+    low = " | ".join(texts).lower()
+    return "acquiring gps" in low or "logging you in" in low or (len(texts) <= 3 and bool(_BUSY_RE.search(low)))
+
+
+def _pin_in_pages(elems: list[dict]) -> bool:
+    """Shift Details, or one of the things InTouch puts over it while pinning in (the "Is this
+    correct?" question, the GPS spinner, the "only when you are on site" refusal). A dialog is its
+    own window, so the page behind it is usually not in the screen dump."""
+    low = " | ".join(_texts(elems)).lower()
+    return _shift_details_screen(elems) or bool(_LOCATION_RE.search(low) or _CONFIRM_PIN_RE.search(low)
+                                                or "acquiring gps" in low)
+
+
+def _is_login_screen(elems: list[dict], cfg: dict) -> bool:
+    return any("EditText" in e["cls"] and e["pkg"] == cfg["package"] for e in elems) \
+        or any("forgotten password" in t for t in _lows(elems))
+
+
+def _exact(elems: list[dict], label: str, lowest: bool | None = None) -> dict | None:
+    """The element labelled exactly ``label`` (a clickable one if there is a choice). ``lowest``:
+    True = the one furthest down the screen (a dialog's button), False = the top one (a title bar)."""
+    hits = [e for e in elems if (e["text"] or e["desc"] or "").strip().lower() == label]
+    if not hits:
+        return None
+    hits = [e for e in hits if e["clickable"]] or hits
+    if lowest is None:
+        return hits[0]
+    return (max if lowest else min)(hits, key=lambda e: e["center"][1])
+
+
+def _leave_pin_in_step(elems: list[dict]) -> str | None:
+    """One step back out of the pin-in pages using InTouch's own buttons: NO on the question,
+    CANCEL on the refusal, CANCEL in the Shift Details title bar. Never YES, never Android's BACK
+    (BACK closes InTouch, and it then wants the password again). Returns what was tapped."""
+    if _on_site_screen(elems):
+        return None  # booked on: the SOS button now sits where Shift Details had CANCEL
+    low = " | ".join(_texts(elems)).lower()
+    if _LOCATION_RE.search(low):
+        target, name = _exact(elems, "cancel", lowest=True), "CANCEL on the location message"
+    elif _CONFIRM_PIN_RE.search(low):
+        target, name = _exact(elems, "no"), "NO on the pin-in question"
+    elif _shift_details_screen(elems) and _exact(elems, "pin in") is not None and not _NEVER_RE.search(low):
+        target, name = _exact(elems, "cancel", lowest=False), "CANCEL on Shift Details"
+        if target is not None:
+            # Aim at the left end of the word: the On Site screen puts its SOS button just right of
+            # where CANCEL is, and that screen can slide in between the look and the tap.
+            x1, y1, x2, y2 = target["bounds"]
+            phone.tap_xy(x1 + max(10, (x2 - x1) // 6), (y1 + y2) // 2)
+            return name
+    else:
+        return None
+    if target is None:
+        return None
+    phone.tap_xy(*target["center"])
+    return name
+
+
+def _leave_pin_in() -> None:
+    """Back from the pin-in pages to the list (at most three of InTouch's own buttons)."""
+    for _ in range(3):
+        time.sleep(1.5)
+        try:
+            elems = screen()
+        except PhoneError:
+            return
+        if _busy(_texts(elems)):
+            continue
+        tapped = _leave_pin_in_step(elems)
+        if not tapped:
+            return
+        log(f"left the pin-in page: tapped {tapped}")
+
+
 def _on_main_tabs(elems: list[dict]) -> bool:
+    if _on_site_screen(elems):
+        return True  # the first tab while a shift is running
     return any(e["desc"].strip().lower() == "selected" for e in elems) and \
         any(e["text"] in TAB_TITLES for e in elems)
 
@@ -515,11 +792,13 @@ def open_intouch(cfg: dict) -> list[dict]:
     deadline = time.time() + 75
     logins = 0
     unknown_since = None
-    relaunched = False
+    relaunches = 0
+    left_details = 0
     while time.time() < deadline:
         time.sleep(1.5)
         elems = screen()
-        texts = " ".join(_texts(elems)).lower()
+        labels = _texts(elems)
+        texts = " ".join(labels).lower()
         if _on_main_tabs(elems):
             return elems
         if _is_autofill_sheet(elems):
@@ -529,6 +808,7 @@ def open_intouch(cfg: dict) -> list[dict]:
             cancel = _labels_hit(elems, ["cancel", "use password", "not now", "no thanks", "skip", "later"])
             if cancel:
                 phone.tap_xy(*cancel["center"])
+                log("cancelled InTouch's fingerprint prompt")
                 unknown_since = None
                 continue
         if _is_system_auth(elems):
@@ -552,27 +832,66 @@ def open_intouch(cfg: dict) -> list[dict]:
             deadline = max(deadline, time.time() + 45)  # give post-login prompts time
             unknown_since = None
             continue
+        if _CANT_START_RE.search(texts):  # "You can't start this shift yet", left on screen
+            ok = _exact(elems, "ok")
+            if ok is not None:
+                phone.tap_xy(*ok["center"])
+                log("closed InTouch's \"can't start this shift yet\" message")
+                unknown_since = None
+                continue
+        if _pin_in_pages(elems):
+            # Left open by an earlier attempt, or the owner is pinning in by hand right now.
+            if _busy(labels):
+                unknown_since = None  # InTouch is looking for GPS: let it finish
+                continue
+            if left_details < 4:
+                tapped = _leave_pin_in_step(elems)
+                left_details += 1
+                if tapped:
+                    log(f"left the pin-in page: tapped {tapped}")
+                    unknown_since = None
+                    continue
+            elif left_details == 4:  # its own CANCEL did not close the page: last resort
+                left_details += 1
+                log("InTouch's CANCEL did not close Shift Details; pressing BACK (InTouch will ask to log in)")
+                phone.shell("input keyevent 4")
+                unknown_since = None
+                continue
         ok = _labels_hit(elems, ["ok", "close", "dismiss", "got it"])
-        if ok and len(elems) < 12:  # a small dialog, not a full screen with an OK somewhere
-            log("dismissed dialog: " + " | ".join(_texts(elems))[:150])
+        if ok and len(elems) < 12 and ok["pkg"] == cfg["package"] and not _NEVER_RE.search(texts):  # a small dialog
+            log("dismissed dialog: " + _say(elems, 150))
             phone.tap_xy(*ok["center"])
             continue
-        # Loading spinners, splash screens, other apps: wait a little, then back / relaunch.
+        blank = not labels
+        if blank:  # InTouch's splash / loading page -- or the display went off under us
+            st = phone.screen_state()
+            if st["locked"]:
+                raise PhoneError("The phone locked itself during the job.")
+            if not st["awake"]:
+                phone.shell("input keyevent 224")
+        # Loading pages and other apps: wait, then bring InTouch forward again. Never BACK: in
+        # InTouch that closes the app, and the next start needs the password again.
         unknown_since = unknown_since or time.time()
-        if time.time() - unknown_since > 12:
-            if not relaunched:
-                phone.shell("input keyevent 4")
-                time.sleep(1.5)
-                phone.open_app(cfg["package"])
-                relaunched = True
-                unknown_since = None
-            else:
+        if time.time() - unknown_since > (25 if blank else 12):
+            if relaunches >= 2:
                 break
-    raise PhoneError("InTouch did not reach its main screen in time. Screen: " + " | ".join(_texts(elems))[:200])
+            if relaunches == 1:
+                phone.shell("input keyevent 3")
+                time.sleep(1.0)
+            phone.open_app(cfg["package"])
+            relaunches += 1
+            unknown_since = None
+    try:
+        front = phone.foreground().split("/")[0]
+    except PhoneError:
+        front = "unknown"
+    raise PhoneError(f"InTouch did not reach its main screen in time. In front: {front}. Screen: " + _say(elems))
 
 
 def goto_tab(index: int) -> list[dict]:
     elems = screen()
+    if index == 0 and _on_site_screen(elems):
+        return elems  # the first tab, in its "On Site" form
     selected = next((e for e in elems if e["desc"].strip().lower() == "selected"), None)
     if selected is None:
         raise PhoneError("Could not find InTouch's tab bar.")
@@ -616,6 +935,8 @@ def read_shift_list(cfg: dict, pages: int = 1) -> tuple[list[str], list[dict]]:
     schedule reads), then scrolls back to the top; book-on reads only the first screen (the
     shift being started is today's, at the top). Returns the first screen's elements."""
     elems = open_tab(cfg, 0)
+    if _on_site_screen(elems):  # a shift is running: there is no list to scroll, and nothing to tap
+        return [t for t in _texts(elems) if t not in TAB_TITLES], elems
     refresh = _labels_hit(elems, ["refresh"])
     if refresh:
         phone.tap_xy(*refresh["center"])
@@ -925,10 +1246,14 @@ def refresh_schedule(cfg: dict) -> list[dict]:
             calendar_ok = False  # keep the shifts we already know rather than "remove" them
             log(f"calendar read failed: {exc}")
             audit("read", "failed", f"calendar part: {exc}")
-    if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts):
+    if not found and cfg["use_ai_for_schedule"] and has_shift_content(texts) \
+            and not any(t.strip().lower() == "time on site" for t in shift_texts):
         found = ai_extract(texts, cfg)
     before = {s["start"]: s for s in load_json(SCHEDULE_FILE, []) if s.get("source") != "manual"}
-    sched = merge_schedule(found, replace_source=calendar_ok)
+    # While a shift is running the first tab shows "On Site", not the list: what the list would have
+    # shown is unknown then, so nothing is treated as removed.
+    on_site = any(t.strip().lower() == "time on site" for t in shift_texts)
+    sched = merge_schedule(found, replace_source=calendar_ok and not on_site)
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     (STATE_DIR / "last_read.txt").write_text("\n".join(texts))
     log(f"schedule refreshed: {len(found)} shift(s) read, {len(sched)} saved")
@@ -1006,10 +1331,10 @@ def _card_for(elems: list[dict], anchor: dict) -> dict | None:
 def _inside(elems: list[dict], box: dict) -> list[str]:
     x1, y1, x2, y2 = box["bounds"]
     return [e["text"] or e["desc"] for e in elems if (e["text"] or e["desc"])
+            and "EditText" not in e.get("cls", "")
             and x1 <= e["center"][0] <= x2 and y1 <= e["center"][1] <= y2]
 
 
-_CANT_START_RE = re.compile(r"can'?t start|cannot start|can not start|not able to start", re.IGNORECASE)
 _STARTS_AT_RE = re.compile(r"started at (\d{1,2}):(\d{2})\s*(am|pm)?", re.IGNORECASE)
 
 
@@ -1022,14 +1347,39 @@ def starts_at(detail: str, shift_start: dt.datetime) -> dt.datetime | None:
     return dt.datetime.combine(shift_start.date(), dt.time(h, mi))
 
 
-START_LABELS = ["start shift", "start", "book on", "sign on", "clock in", "check in", "confirm", "yes",
+START_LABELS = ["pin in", "start shift", "start", "book on", "sign on", "clock in", "check in", "confirm", "yes",
                 "continue"]
+_DETAILS_DATE_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)? ([A-Za-z]{3,9}) (\d{4})\b")
+
+
+def _details_mismatch(texts: list[str], start: dt.datetime) -> str | None:
+    """Shift Details names the shift (Date: Tue 24 November 2026, Shift window: 14:00 - 20:00).
+    If it is clearly another shift, say so; if it cannot be read, don't block."""
+    for t in texts:
+        m = _DETAILS_DATE_RE.search(t)
+        month = _MONTHS.get(m.group(2).lower()) if m else None
+        if month:
+            try:
+                shown = dt.date(int(m.group(3)), month, int(m.group(1)))
+            except ValueError:
+                continue
+            if shown != start.date():
+                return f"Shift Details showed {shown:%a %d %b}, not the {start:%a %d %b %H:%M} shift"
+            break
+    for t in texts:
+        m = _TIME_RANGE_RE.search(t)
+        if m:
+            if _hm(m.group(1), m.group(2), m.group(3)) != (start.hour, start.minute):
+                return f"Shift Details showed a shift starting {t.split('-')[0].strip()}, not {start:%H:%M}"
+            break
+    return None
 
 
 def _start_by_card(cfg: dict, elems: list[dict], anchor: dict, start: dt.datetime,
                    dry_run: bool) -> tuple[str, str]:
-    """InTouch starts (books on to) a shift by tapping its card on the Shift List. Before the
-    allowed time it says "You can't start this shift yet -- can be started at 10:45 am"."""
+    """InTouch starts (books on to) a shift from its card on the Shift List. Before the allowed
+    time, tapping the card says "You can't start this shift yet -- can be started at 10:45 am".
+    Inside the window it opens Shift Details, and _pin_in_flow takes it from there."""
     card = _card_for(elems, anchor)
     if card is None:
         return "failed", "found the shift's time but not its card to tap"
@@ -1041,55 +1391,165 @@ def _start_by_card(cfg: dict, elems: list[dict], anchor: dict, start: dt.datetim
         return "dry_run", f"would tap the {start:%H:%M} shift card at {card['center']}"
     phone.tap_xy(*card["center"])
     log(f"tapped the {start:%H:%M} shift card")
+    return _pin_in_flow(cfg, start)
+
+
+def _pin_in_flow(cfg: dict, start: dt.datetime) -> tuple[str, str]:
+    """From the tapped card to "On Site" (seen in the owner's screen recording, 24 Nov 2026):
+
+        Shift Details --PIN IN--> "You are about to Pin In to confirm attendance. Is this correct?"
+        --YES--> "Acquiring GPS" (up to ~20 s) --> the On Site screen, or
+        "You can only book on when you are on site ... verify your location" [TRY AGAIN | CANCEL]
+        (TRY AGAIN asks the question again; it took the owner three goes while standing at the site).
+
+    Works from whichever of those is showing. Presses only PIN IN, YES, TRY AGAIN and OK -- and
+    InTouch's own NO / CANCEL to step back out. Never Android's BACK: that closes InTouch."""
+    shift_key = start.isoformat(timespec="minutes")
     seen: list[str] = []
-    for _step in range(4):  # a message, a confirm step, maybe a second confirm
-        time.sleep(3)
-        elems = screen()
+    began = time.time()
+    budget = cfg.get("pin_in_seconds", 150)
+    pin_taps = yes_taps = gps_fails = ok_taps = away = 0
+    last_pin_step = -99
+    last_yes = 0.0
+    spinner = False
+    elems: list[dict] = []
+    for step in range(200):  # a look every ~3-5 s; the time budget below is what normally ends it
+        spent = time.time() - began
+        if spent > budget and not (spinner and time.time() - last_yes < 45):
+            break  # (a GPS look that is still running is always allowed to finish)
+        time.sleep(2)
+        try:
+            if phone.in_call():
+                return "in_call", "a phone call started while booking on"
+            elems = screen()
+        except PhoneError:
+            continue  # mid-animation; look again
+        if elems and not any(e["pkg"] == cfg["package"] for e in elems):
+            away += 1  # another app (or a system sheet) is in front: touch nothing
+            if away >= 4:
+                return "error", "another app came to the front while booking on"
+            continue
+        away = 0
+        spinner = False
         texts = _texts(elems)
         seen += [t for t in texts if t not in seen and t not in TAB_TITLES]
-        low = " ".join(texts).lower()
-        if _on_main_tabs(elems):
-            if _step == 0:
-                continue  # InTouch may still be opening its message
-            break  # back on the list with no dialog
+        low = " | ".join(texts).lower()
+        if _on_site_screen(elems):
+            return "booked", "InTouch shows the On Site screen" + (f" (after {gps_fails} GPS refusals)" if gps_fails else "")
         if _CANT_START_RE.search(low):
             ok = _labels_hit(elems, ["ok", "close", "dismiss"])
             if ok:
                 phone.tap_xy(*ok["center"])
             return "not_available", " | ".join(t for t in texts if t not in TAB_TITLES)[:300]
-        buttons = [e for e in elems if e["clickable"] and (e["text"] or e["desc"])]
-        safe = []
-        for b in buttons:
-            try:
-                phone.check_allowed(b["text"] or b["desc"], force=False)
-                safe.append(b)
-            except PhoneError:
-                pass
-        go = _labels_hit(safe, START_LABELS)
-        if go:
-            label = go["text"] or go["desc"]
-            phone.tap_xy(*go["center"])
-            log(f"tapped \"{label}\"")
-            audit("book_on", "tapped", f"tapped \"{label}\" -- screen said: " + " | ".join(texts)[:200],
-                  shift=start.isoformat(timespec="minutes"))
+        if _LOCATION_RE.search(low):
+            gps_fails += 1
+            again = _exact(elems, "try again")
+            if again is not None and gps_fails < cfg.get("gps_tries", 3) and spent < budget - 30:
+                phone.tap_xy(*again["center"])
+                log(f"InTouch could not confirm the location (try {gps_fails}); tapped TRY AGAIN")
+                audit("book_on", "retry", f"InTouch could not confirm you are on site (GPS, try {gps_fails}); "
+                      "tapped TRY AGAIN", shift=shift_key)
+                continue
+            _leave_pin_in()
+            return "no_gps", (f"InTouch could not confirm you are on site (GPS), tried {gps_fails} time(s): "
+                              "\"You can only book on when you are on site\"")
+        if _CONFIRM_PIN_RE.search(low):
+            yes = _exact(elems, "yes")
+            if spent > budget - 25:  # no time left for another GPS look: answer NO and stop here
+                _leave_pin_in()
+                return "no_gps", f"ran out of time for this attempt after {gps_fails} GPS refusal(s)"
+            if yes is not None and not _NEVER_RE.search(low) and yes_taps < 6:
+                phone.tap_xy(*yes["center"])
+                yes_taps += 1
+                last_yes = time.time()
+                log("tapped YES on \"You are about to Pin In to confirm attendance\"")
+                audit("book_on", "tapped", "tapped YES on InTouch's question: about to Pin In to confirm attendance",
+                      shift=shift_key)
             continue
-        ok = _labels_hit(safe, ["ok", "close", "dismiss", "got it"])
-        if ok:  # an information message (e.g. not at the site): record it and close it
-            phone.tap_xy(*ok["center"])
-            time.sleep(2)
-            break
-        if not _on_main_tabs(elems):  # a details page or something unexpected
-            phone.shell("input keyevent 4")
-            time.sleep(2)
-            break
-    texts2, elems2 = read_shift_list(cfg)
-    anchor2 = _shift_anchor(elems2, start)
-    card2 = _card_for(elems2, anchor2) if anchor2 else None
-    status = " ".join(_inside(elems2, card2)).lower() if card2 else ""
-    if any(re.search(r"\b" + re.escape(b) + r"\b", status) for b in cfg["booked_labels"]):
-        return "booked", "card now shows: " + " | ".join(_inside(elems2, card2))[:150] + \
-            (" -- InTouch said: " + " | ".join(seen)[:150] if seen else "")
-    return "failed", ("InTouch said: " + " | ".join(seen) if seen else "no response to tapping the card")[:300]
+        if _busy(texts) or not texts:
+            spinner = True
+            phone.shell("input keyevent 224")  # keep the screen on while InTouch looks for GPS
+            continue
+        if _is_login_screen(elems, cfg) or "fingerprint" in low or _is_system_auth(elems):
+            return "error", "InTouch asked for a login in the middle of booking on"
+        if _shift_details_screen(elems):
+            pin = _exact(elems, "pin in")
+            if pin is None or step - last_pin_step < 3:
+                continue  # still drawing, or the question is on its way
+            wrong = _details_mismatch(texts, start)
+            if wrong:
+                _leave_pin_in()
+                return "failed", wrong
+            if pin_taps >= 3:
+                break
+            phone.check_allowed(pin["text"] or pin["desc"], force=False)
+            phone.tap_xy(*pin["center"])
+            pin_taps += 1
+            last_pin_step = step
+            log("tapped PIN IN on Shift Details")
+            audit("book_on", "tapped", "tapped PIN IN on Shift Details", shift=shift_key)
+            continue
+        if _on_main_tabs(elems):
+            if step < 3:
+                continue  # Shift Details is still sliding in
+            anchor2 = _shift_anchor(elems, start)
+            card2 = _card_for(elems, anchor2) if anchor2 else None
+            status = " ".join(_inside(elems, card2)).lower() if card2 else ""
+            if any(re.search(r"\b" + re.escape(b) + r"\b", status) for b in cfg["booked_labels"]):
+                return "booked", "card now shows: " + " | ".join(_inside(elems, card2))[:150]
+            break  # back on the list with nothing started
+        ok = _exact(elems, "ok")
+        labelled = [e for e in elems if e["clickable"] and (e["text"] or e["desc"])]
+        if ok is not None and len(labelled) == 1 and len(elems) < 12 and ok_taps < 3 and not _NEVER_RE.search(low):
+            phone.tap_xy(*ok["center"])  # a one-button information message: it is recorded in `seen`
+            ok_taps += 1
+    try:
+        last = screen()
+        if _on_site_screen(last):
+            return "booked", "InTouch shows the On Site screen"
+        if _busy(_texts(last)):  # still looking for GPS: do not press anything over it
+            return "failed", "InTouch was still looking for GPS when this attempt ran out of time"
+    except PhoneError:
+        pass
+    _leave_pin_in()
+    said = _scrub(" | ".join(seen))
+    return "failed", ("InTouch said: " + said if said else "no response to tapping the card")[:300]
+
+
+def _time_on_site(elems: list[dict]) -> dt.timedelta | None:
+    """The On Site screen's TIME ON SITE value. It counts from the shift's START: "-4 min" when
+    pinned in four minutes early."""
+    texts = _texts(elems)
+    for i, t in enumerate(texts[:-1]):
+        if t.strip().lower() == "time on site":
+            raw = texts[i + 1].strip()
+            d = _duration(raw.lstrip("-\u2212\u2013 ").strip())
+            if d is None:
+                return None
+            return -d if raw[:1] in ("-", "\u2212", "\u2013") else d
+    return None
+
+
+def _on_site_outcome(shift: dict | None, elems: list[dict] | None = None,
+                     now: dt.datetime | None = None) -> tuple[str, str]:
+    """InTouch shows its On Site screen: booked on -- but for THIS shift? An On Site screen left
+    from an earlier shift (not pinned out) must not count as this shift's book-on."""
+    now = now or dt.datetime.now()
+    if shift:
+        start = dt.datetime.fromisoformat(shift["start"])
+        on_site = _time_on_site(elems or [])
+        if on_site is not None:
+            if abs((on_site - (now - start)).total_seconds()) <= 20 * 60:
+                return "already", "InTouch shows the On Site screen: you are booked on"
+            mins = int(on_site.total_seconds() // 60)
+            return "other_shift", (f"InTouch shows On Site with {mins} min on site, which does not fit the "
+                                   f"{start:%H:%M} shift: an earlier shift still looks pinned in")
+        now_iso = now.isoformat(timespec="minutes")
+        for other in load_json(SCHEDULE_FILE, []):  # the time could not be read: go by the schedule
+            if other["start"] < shift["start"] and (other.get("end") or other["start"]) >= now_iso:
+                return "other_shift", ("InTouch still shows On Site for the shift that started "
+                                       f"{other['start'][11:16]}")
+    return "already", "InTouch shows the On Site screen: you are booked on"
 
 
 def _nearest(elems: list[dict], anchor: dict | None) -> dict | None:
@@ -1115,13 +1575,23 @@ def _all_hits(elems: list[dict], labels: list[str], clickable_only: bool = True)
 def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) -> tuple[str, str]:
     """One attempt for ``shift`` (or the only/first shift shown). Returns (outcome, detail):
     booked | already | not_available | failed | locked | error | dry_run."""
+    took_over = False
     try:
         access = ensure_awake_unlocked()
         if access == "in_call":
             return "in_call", "a phone call is in progress"
         if access == "locked":
             return "locked", "phone is locked"
+        took_over = True
         texts, elems = read_shift_list(cfg)
+        if _on_site_screen(elems):
+            return _on_site_outcome(shift, elems)
+        for _ in range(4):  # just resumed: InTouch shows "Offline" for a moment; a tap then goes nowhere
+            if not any(t.strip().lower() == "offline" for t in texts):
+                break
+            time.sleep(2.5)
+            elems = screen()
+            texts = [t for t in _texts(elems) if t not in TAB_TITLES]
         # Opportunistically add shifts shown now that the schedule does not know yet.
         new = parse_shifts([t for t in texts if NO_SHIFTS_TEXT not in t.lower()])
         if new:
@@ -1182,12 +1652,13 @@ def book_on_once(cfg: dict, dry_run: bool = False, shift: dict | None = None) ->
             phone.tap_xy(*ok["center"])
         return "failed", " | ".join(after)[:300]
     except PhoneError as exc:
-        return "error", str(exc)
+        return "error", (str(exc).splitlines() or [""])[0]
     finally:
-        try:
-            phone.shell("input keyevent 3")
-        except PhoneError:
-            pass
+        if took_over:  # nothing was touched otherwise (locked, or a call is on screen)
+            try:
+                phone.shell("input keyevent 3")
+            except PhoneError:
+                pass
         relock_if_we_unlocked()
 
 
@@ -1208,7 +1679,10 @@ def reconnect_adb() -> bool:
     # listening TCP ports on localhost (refused ports answer instantly; takes a few seconds).
     for port in _open_local_ports(30000, 65535, skip={5555}):
         host_port = f"127.0.0.1:{port}"
-        out = phone.adb("connect", host_port, serial=False, check=False, timeout=8)
+        try:
+            out = phone.adb("connect", host_port, serial=False, check=False, timeout=8)
+        except PhoneError:  # some other service's port that never answers
+            continue
         if "connected" not in out or "cannot" in out or "failed" in out:
             continue
         devices = phone.adb("devices", serial=False, check=False)
@@ -1272,7 +1746,11 @@ class _Service:
             phone.ensure_connected()
             ok = True
         except PhoneError:
-            ok = reconnect_adb()
+            try:
+                ok = reconnect_adb()
+            except PhoneError as exc:  # e.g. "adb timed out: connect 127.0.0.1:36015"
+                log(f"reconnect failed: {exc}")
+                ok = False
         if not ok:
             nxt = next_shift(load_json(SCHEDULE_FILE, []), cfg)
             when = f" before your {nxt['start'][5:].replace('T', ' ')} shift" if nxt else ""
@@ -1332,8 +1810,11 @@ class _Service:
         cfg = config()
         now = now or dt.datetime.now()
         sched = load_json(SCHEDULE_FILE, [])
-        if self.link(cfg):
-            resume_unlock_if_user_unlocked()
+        try:
+            if self.link(cfg):
+                resume_unlock_if_user_unlocked()
+        except Exception as exc:  # a link hiccup must not cost a book-on attempt
+            log(f"link check failed (continuing): {exc!r}"[:300])
         # 1. Schedule reads: only at each check time (overdue slots collapse into one read), and on
         #    the very first start. Never during a window. Failed reads back off and give up.
         due = [f"{now:%Y-%m-%d} {h}" for h in cfg["check_times"]
@@ -1375,7 +1856,11 @@ class _Service:
             self.save()
         # 2. Book-on windows -- every shift on its own, so two shifts in a day are both handled.
         for shift in sched:
-            self.handle_shift(shift, cfg, now)
+            try:
+                self.handle_shift(shift, cfg, now)
+            except Exception as exc:  # one shift's problem never blocks another's
+                log(f"book-on handling for {shift.get('start')} failed (continuing): {exc!r}"[:300])
+                audit("book_on", "error", f"unexpected problem: {exc!r}"[:200], shift=shift.get("start"))
         cutoff = (now - dt.timedelta(days=3)).isoformat(timespec="minutes")
         self.state["shifts"] = {k: v for k, v in self.state["shifts"].items() if k >= cutoff}
         self.save()
@@ -1407,17 +1892,22 @@ class _Service:
         last = st.get("last_attempt")
         # While the phone is locked, look again every ~20 s (a cheap check) so the book-on
         # happens within seconds of the user unlocking; otherwise every retry_every_min.
-        gap = 20 if st.get("last_outcome") in ("locked", "in_call") else cfg["retry_every_min"] * 60
+        gap = 20 if st.get("last_outcome") in ("locked", "in_call") else \
+            60 if st.get("last_outcome") in ("no_gps", "error") else cfg["retry_every_min"] * 60
         if last and (now - dt.datetime.fromisoformat(last)).total_seconds() < gap:
             return
         if st.get("not_before") and now < dt.datetime.fromisoformat(st["not_before"]):
             return  # InTouch said when the shift can be started; don't open it before then
         st["last_attempt"] = now.isoformat(timespec="seconds")
         st["attempts"] += 1
+        t0 = time.time()
         if not self.link(cfg, force=True):
             outcome, detail = "error", "phone-control link is down"
         else:
             outcome, detail = book_on_once(cfg, shift=shift)
+        # The wait before the next try counts from when this one ENDED (an attempt can take minutes).
+        st["last_attempt"] = (now + dt.timedelta(seconds=time.time() - t0)).isoformat(timespec="seconds")
+        detail = _scrub(detail)
         st["last_outcome"], st["last_detail"] = outcome, detail
         allowed = starts_at(detail, dt.datetime.fromisoformat(shift["start"])) if outcome == "not_available" else None
         if allowed and allowed > now:
@@ -1442,7 +1932,18 @@ class _Service:
                 notify("Unlock your phone", f"Unlock it and I'll book you on for {label} straight away "
                        f"(window closes {closes:%H:%M}).", nid="intouch-unlock")
                 st["locked_notified_at"] = now.isoformat(timespec="seconds")
-        elif outcome == "error" and not st.get("error_notified"):
+        elif outcome == "no_gps" and not st.get("gps_notified"):
+            notify("InTouch can't see you on site yet",
+                   f"{label} shift: InTouch's GPS check refused the book-on. I'll keep trying until "
+                   f"{closes:%H:%M} -- it works once the phone has a GPS fix at the site.",
+                   nid=f"intouch-{shift['start']}")
+            st["gps_notified"] = True
+        elif outcome == "other_shift" and not st.get("other_notified"):
+            notify("InTouch still shows an earlier shift",
+                   f"I can't book you on for {label}: InTouch is still On Site from an earlier shift. "
+                   "Pin out of that one (or pin in by hand).", nid=f"intouch-{shift['start']}")
+            st["other_notified"] = True
+        elif outcome in ("error", "failed") and not st.get("error_notified"):
             notify("Auto book-on problem", f"{detail[:150]} -- still retrying until {closes:%H:%M}.",
                    nid=f"intouch-{shift['start']}")
             st["error_notified"] = True
@@ -1781,7 +2282,7 @@ def main(argv: list[str] | None = None) -> int:
             daemon(cfg)
         elif args.cmd == "log":
             lines = LOG_FILE.read_text().splitlines() if LOG_FILE.exists() else []
-            print("\n".join(lines[-args.n:]))
+            print(_scrub("\n".join(lines[-args.n:])))
         elif args.cmd == "config":
             current = load_json(CONFIG_FILE, {})
             if args.key and args.value is not None:

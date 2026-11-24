@@ -27,7 +27,7 @@ the user. If the window closes without a book-on it notifies them to do it by ha
 - Several shifts a day are handled independently: each attempt anchors on that shift's start
   time on screen and taps the book-on control of that card only.
 - When the user asks what the service did, or why a book-on failed, run `$IT audit` (add
-  `--failures` for problems only) and summarise it; it never contains the password or PIN.
+  `--failures` for problems only) and summarise it (its output is scrubbed of the saved password).
 - InTouch day headings have no year ("SUNDAY 22ND NOVEMBER"); a shift may show as a range
   ("Sun 07:00 - 19:00") or as a start plus length ("Sun 07:00" + "12 hr"). "On Site" on a card
   means booked on.
@@ -38,6 +38,22 @@ the user. If the window closes without a book-on it notifies them to do it by ha
   watchdog job restarts it if Android kills it or the phone reboots.
 - InTouch is erratic (fingerprint prompts before and/or after the password, random dialogs);
   the opener handles them in any order and relaunches the app when stuck.
+- Booking on, as InTouch really does it (owner's screen recording, 24 Nov 2026): tap the shift's
+  card -> "Shift Details" -> PIN IN -> "You are about to Pin In to confirm attendance. Is this
+  correct?" -> YES -> "Acquiring GPS" (up to ~20 s) -> the "On Site" screen. Often InTouch first
+  answers "You can only book on when you are on site" (TRY AGAIN / CANCEL) even at the site; the
+  service taps TRY AGAIN up to `gps_tries` (3) times per attempt, then reports `no_gps` and tries
+  again a minute later until the window closes.
+- NEVER press Android BACK inside InTouch: it closes the app and the next start needs the password
+  again. Leave pages with InTouch's own NO / CANCEL, or HOME (which keeps the session).
+- The "On Site" screen is the first tab while a shift runs. Nothing on it is ever tapped (it has an
+  unlabeled SOS button top-right, CHECK CALL and a call-the-manager button). An On Site screen
+  whose TIME ON SITE does not fit the shift being booked is an earlier shift still pinned in
+  (`other_shift`): the user must pin out.
+- The password is typed only into a HIDDEN password box (the eye next to it crossed out). If the
+  box shows its text the service taps the eye first, and refuses to type if it cannot hide it.
+  Screen text from input boxes is never logged; log, audit and notifications are scrubbed of the
+  saved password as well. Never run `phone.py screen` output from a login page into a chat.
 
 ```bash
 IT="python ~/.hermes/skills/android/intouch/scripts/intouch.py"
