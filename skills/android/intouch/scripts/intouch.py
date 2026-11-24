@@ -424,38 +424,31 @@ def _hide_password_box(box: dict) -> bool:
     """Make sure the password box hides what is typed (its eye is OFF) BEFORE the password goes in,
     so nobody next to the phone can read it. True only once that is certain.
 
-    A hidden box is marked as a password box by Android and shows dots. If it is not marked, one
-    throw-away character settles it: if that character can be read back, the box is in "show" mode
-    and the eye is tapped to switch it off."""
-    for _ in range(3):
+    Checked on the phone, 24 Nov 2026: Android marks the box as a password box exactly when it
+    really hides its text (marked -> a typed character reads back as a dot; not marked -> it reads
+    back in clear, whatever the eye icon looks like). And InTouch has a quirk: after a fresh start
+    the eye icon is crossed out but the box SHOWS its text; the first tap on the eye only makes the
+    icon honest, the second one hides the text. So: tap the eye until the box is marked."""
+    for taps in range(5):
         now, elems = _box_now(box)
         if now is None or not _cursor_in(now, elems):
             return False
+        if now.get("focused") is False:  # the eye tap took the cursor out: put it back
+            phone.tap_xy(*now["center"])
+            time.sleep(1.0)
+            _dismiss_autofill_sheet()
+            now, elems = _box_now(box)
+            if now is None or not _cursor_in(now, elems):
+                return False
         if now["password"]:
+            if taps:
+                log(f"the password box was showing its text: switched it to hidden ({taps} tap(s) on the eye)")
+                audit("login", "info", "the password box was showing its text; switched it to hidden before typing")
             return True
-        if (now["text"] or "").strip().lower() not in ("", "password"):
-            _clear_field(now)  # leftovers: the test below needs an empty box
-            time.sleep(0.8)
-            continue
-        phone.shell("input text x")
-        time.sleep(0.8)
-        now, elems = _box_now(box)
-        probe = (now or {}).get("text", "")
-        phone.shell("input keyevent KEYCODE_DEL")  # wherever it went, take it out again
-        if now is None:
-            return False
-        if now["password"] or (len(probe) == 1 and not probe.isalnum()):
-            return True  # it came back as a dot
-        if probe != "x":
-            time.sleep(1.0)  # the character did not land in the box: nothing is proven, look again
-            continue
+        if taps == 4:
+            break
         phone.tap_xy(*_eye_button(elems, now))
-        log("the password box was showing its text: switched it to hidden (tapped the eye)")
-        audit("login", "info", "the password box was in 'show' mode; switched it to hidden before typing")
-        time.sleep(0.8)
-        phone.tap_xy(*now["center"])  # focus back in the box
-        time.sleep(0.8)
-        _dismiss_autofill_sheet()
+        time.sleep(1.0)
     return False
 
 

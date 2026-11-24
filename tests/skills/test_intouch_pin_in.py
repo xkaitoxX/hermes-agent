@@ -439,9 +439,11 @@ class FakeLoginForm:
     BOX = (60, 560, 1010, 660)
     EYE = (1040, 570, 1160, 650)
 
-    def __init__(self, showing, eye_works=True):
-        self.showing, self.eye_works = showing, eye_works
-        self.text, self.logged_in, self.exposed, self.submitted = "", False, [], []
+    def __init__(self, showing, eye_works=True, fresh_start=False):
+        # fresh_start: InTouch's quirk -- the box shows its text although the eye icon is crossed
+        # out; the first tap on the eye changes only the icon, the second one hides the text.
+        self.showing, self.eye_works, self.icon_lies = showing, eye_works, fresh_start
+        self.text, self.logged_in, self.exposed, self.submitted, self.eye_taps = "", False, [], [], 0
 
     def screen(self):
         if self.logged_in:
@@ -468,8 +470,12 @@ class FakeLoginForm:
 
     def tap(self, x, y):
         inside = lambda b: b[0] <= x <= b[2] and b[1] <= y <= b[3]  # noqa: E731
-        if inside(self.EYE) and self.eye_works:
-            self.showing = not self.showing
+        if inside(self.EYE):
+            self.eye_taps += 1
+            if self.icon_lies:
+                self.icon_lies = False                       # first tap: only the icon changes
+            elif self.eye_works:
+                self.showing = not self.showing
         elif inside((60, 760, 1150, 900)):
             self.submitted.append(self.text)
             self.logged_in = self.text == SECRET
@@ -496,6 +502,16 @@ def test_password_box_already_hidden_is_just_typed(intouch, env, monkeypatch):
     form = FakeLoginForm(showing=False)
     _login(intouch, env, monkeypatch, form)
     assert form.logged_in and form.exposed == [] and form.showing is False
+    assert form.eye_taps == 0                                # a hidden box: the eye is left alone
+
+
+def test_fresh_start_quirk_needs_two_eye_taps(intouch, env, monkeypatch):
+    form = FakeLoginForm(showing=True, fresh_start=True)     # icon says hidden, box shows text
+    _login(intouch, env, monkeypatch, form)
+    assert form.eye_taps == 2 and form.showing is False
+    assert form.logged_in and form.exposed == []             # typed only once truly hidden
+    notes = [r for r in intouch.read_audit(1) if r["action"] == "login" and r["result"] == "info"]
+    assert len(notes) == 1                                   # said once, not per tap
 
 
 def test_password_is_not_typed_if_the_box_will_not_hide(intouch, env, monkeypatch):
